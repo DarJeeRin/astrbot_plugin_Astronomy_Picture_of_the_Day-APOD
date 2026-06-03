@@ -11,6 +11,14 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
+# 尝试使用框架提供的 MessageChain；若不存在则回退到轻量包装类，保证主动推送时有 `.chain` 属性。
+try:
+    from astrbot.api import MessageChain  # type: ignore
+except Exception:
+    class MessageChain:  # pragma: no cover - fallback
+        def __init__(self, chain):
+            self.chain = chain
+
 
 @register("apod", "Cysheper", "NASA APOD plugin", "0.0.1")
 class APOD(Star):
@@ -269,7 +277,16 @@ class APOD(Star):
 
         for target in targets:
             try:
-                await self.context.send_message(target, self._build_chain_from_payload(payload))
+                msg_list = self._build_chain_from_payload(payload)
+                # 包装为 MessageChain（框架需要具有 .chain 属性的对象）
+                msg = MessageChain(msg_list)
+                logger.debug(
+                    "send_message target=%s type=%s has_chain=%s",
+                    target,
+                    type(msg),
+                    hasattr(msg, "chain"),
+                )
+                await self.context.send_message(target, msg)
                 success_count += 1
             except Exception as exc:
                 logger.error(f"自动推送任务：向会话 {target} 发送失败：{exc}")
