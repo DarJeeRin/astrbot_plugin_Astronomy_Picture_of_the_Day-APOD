@@ -75,5 +75,33 @@
         "description": "遇到 NASA API 临时错误时的重试次数",
         "type": "int",
         "default": 2
+    },
+    "push": {
+        "description": "自动推送配置",
+        "type": "object",
+        "items": {
+            "enabled": {
+                "description": "是否启用自动推送",
+                "type": "bool",
+                "default": true
+            },
+            "target_unified_msg_origins": {
+                "description": "自动推送目标会话 UMO 列表",
+                "hint": "可通过 /sid 获取 UMO；支持数组，或使用逗号/换行分隔的字符串",
+                "type": "list",
+                "default": []
+            },
+            "daily_push_time": {
+                "description": "每天自动推送时间（本机时区，24小时制 HH:MM）",
+                "hint": "示例：09:00、20:30；若格式不合法会回退到 09:00",
+                "type": "string",
+                "default": "09:00"
+            },
+            "max_groups_per_round": {
+                "description": "单轮最多推送的会话数量，0 表示不限制",
+                "type": "int",
+                "default": 0
+            }
+        }
     }
 }

@@ -1,8 +1,8 @@
 # ruff: noqa: UP006, UP035, UP045
 import asyncio
 import hashlib
-from datetime import datetime
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 
@@ -11,17 +11,40 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
+# 尝试使用框架提供的 MessageChain；若不存在则回退到轻量包装类，保证主动推送时有 `.chain` 属性。
+try:
+    from astrbot.api import MessageChain  # type: ignore
+except Exception:
+    class MessageChain:  # pragma: no cover - fallback
+        def __init__(self, chain):
+            self.chain = chain
+
 
 @register("apod", "Cysheper", "NASA APOD plugin", "0.0.1")
 class APOD(Star):
+    APOD_CACHE_KEY = "apod_cache"
+    PUSH_LAST_SENT_DATE_KEY = "apod_push:last_sent_date"
+    PUSH_PAYLOAD_KEY_PREFIX = "apod_push:last_payload:"
+
     def __init__(self, context: Context, config: AstrBotConfig):
         self.config = config
         self.context = context
         self.last_apod_error: Optional[str] = None
+        self.push_task: Optional[asyncio.Task] = None
 
     @staticmethod
     def _ensure_dict(value: Any) -> Dict[str, Any]:
         return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _ensure_str_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            # 兼容字符串配置：支持换行或逗号分隔。
+            normalized = value.replace(",", "\n")
+            return [item.strip() for item in normalized.splitlines() if item.strip()]
+        return []
 
     def _needs_translation(self) -> bool:
         explanation_needs_translation = bool(self.explanation.get("is_show")) and bool(
@@ -45,6 +68,34 @@ class APOD(Star):
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         return f"translate_cache:{digest}"
 
+    @classmethod
+    def _build_push_payload_cache_key(cls, apod_date: str) -> str:
+        return f"{cls.PUSH_PAYLOAD_KEY_PREFIX}{apod_date}"
+
+    @staticmethod
+    def _normalize_daily_push_time(value: Any) -> str:
+        raw = str(value).strip() if value is not None else ""
+        if not raw:
+            return "09:00"
+        try:
+            parsed = datetime.strptime(raw, "%H:%M")
+            return parsed.strftime("%H:%M")
+        except ValueError:
+            logger.warning(
+                f"push.daily_push_time 配置无效：{raw}，将回退为默认值 09:00（格式示例：08:30）。"
+            )
+            return "09:00"
+
+    def _seconds_until_next_daily_push(self) -> int:
+        now = datetime.now()
+        push_time = datetime.strptime(self.daily_push_time, "%H:%M").time()
+        next_push_at = now.replace(
+            hour=push_time.hour, minute=push_time.minute, second=0, microsecond=0
+        )
+        if next_push_at <= now:
+            next_push_at += timedelta(days=1)
+        return max(1, int((next_push_at - now).total_seconds()))
+
     async def initialize(self):
         logger.info("正在初始化 NASA APOD 插件...")
 
@@ -62,47 +113,47 @@ class APOD(Star):
         self.timeout = max(1, int(self.config.get("timeout", 120)))
         self.retry_count = max(0, int(self.config.get("retry_count", 2)))
 
-        # 如果启用了翻译但没有配置 provider，就提前结束。
+        self.push = self._ensure_dict(self.config.get("push", {}))
+        self.push_enabled = bool(self.push.get("enabled", True))
+        self.target_unified_msg_origins = self._ensure_str_list(
+            self.push.get("target_unified_msg_origins", [])
+        )
+        self.daily_push_time = self._normalize_daily_push_time(
+            self.push.get("daily_push_time", "09:00")
+        )
+        self.max_groups_per_round = max(0, int(self.push.get("max_groups_per_round", 0)))
+
+        # 如果启用了翻译但没有配置 provider，就提前提示。
         if self._needs_translation() and not self.provider:
             logger.warning(
                 "已启用翻译功能，但未配置 provider，请在插件配置中填写 `provider` 字段。"
             )
 
-    @filter.command("apod")
-    async def apod(self, event: AstrMessageEvent):
-        logger.info("正在获取 NASA 每日天文图片...")
-
-        if self._needs_translation() and not self.provider:
+        if self.push_enabled and self.target_unified_msg_origins:
+            self.push_task = asyncio.create_task(self._push_loop())
+            logger.info(
+                f"APOD 自动推送任务已启动：每天 {self.daily_push_time} 执行，目标会话 {len(self.target_unified_msg_origins)} 个。"
+            )
+        elif self.push_enabled:
             logger.warning(
-                "已启用翻译功能，但未配置 provider，请在插件配置中填写 `provider` 字段。"
+                "APOD 自动推送已启用，但未配置 target_unified_msg_origins，不会执行群推送。"
             )
-            yield event.plain_result(
-                "已启用翻译功能，但未配置 provider，请在插件配置中填写 provider 字段。"
-            )
-            return
+        else:
+            logger.info("APOD 自动推送已禁用。")
 
-        # 如果今天的 APOD 缓存仍然有效，就优先复用缓存数据。
-        apod_data = await self.get_cache_apod()
-        if not apod_data:
-            yield event.plain_result(
-                self.last_apod_error or "获取 APOD 数据失败，请稍后重试。"
-            )
-            return
-
-        # 当要求返回图片时，如果当天 APOD 不是图片类型，就直接视为失败。
+    def _validate_apod_output(self, apod_data: Dict[str, Any]) -> Optional[str]:
         if apod_data.get("media_type") != "image" and self.image:
-            yield event.plain_result("今天的 APOD 不是图片类型，请稍后再试。")
-            return
+            return "今天的 APOD 不是图片类型，请稍后再试。"
+        url = apod_data.get("hdurl", apod_data.get("url"))
+        if self.image and not url:
+            return "获取 APOD 图片链接失败，请稍后重试。"
+        return None
 
+    async def _build_display_payload(self, apod_data: Dict[str, Any]) -> Dict[str, str]:
         explanation = apod_data.get("explanation")
         title = apod_data.get("title")
         url = apod_data.get("hdurl", apod_data.get("url"))
-        date = apod_data.get("date")
-
-        # 图片模式还要求 NASA 返回可用的图片链接。
-        if not url and self.image:
-            yield event.plain_result("获取 APOD 图片链接失败，请稍后重试。")
-            return
+        apod_date = apod_data.get("date")
 
         explanation_zh, title_zh = None, None
         try:
@@ -141,48 +192,189 @@ class APOD(Star):
         except Exception as exc:
             logger.error(f"翻译 APOD 内容失败：{exc}")
 
-        display_title = (title_zh or title or "").strip()
-        display_date = str(date).strip() if date else ""
-        display_explanation = (explanation_zh or explanation or "").strip()
+        return {
+            "url": str(url).strip() if url else "",
+            "title": (title_zh or title or "").strip(),
+            "date": str(apod_date).strip() if apod_date else "",
+            "explanation": (explanation_zh or explanation or "").strip(),
+        }
+
+    def _build_chain_from_payload(self, payload: Dict[str, str]) -> List[Any]:
+        chain = []
+        if self.image and payload.get("url"):
+            chain.append(Comp.Image.fromURL(payload["url"]))
+        if self.title.get("is_show") and payload.get("title"):
+            chain.append(Comp.Plain(f"标题：{payload['title']}\n"))
+        if self.date.get("is_show") and payload.get("date"):
+            chain.append(Comp.Plain(f"日期：{payload['date']}\n"))
+        if self.explanation.get("is_show") and payload.get("explanation"):
+            chain.append(Comp.Plain(payload["explanation"]))
+        return chain
+
+    def _get_round_targets(self) -> List[str]:
+        targets = list(self.target_unified_msg_origins)
+        if self.max_groups_per_round > 0:
+            return targets[: self.max_groups_per_round]
+        return targets
+
+    async def _get_or_build_push_payload(
+        self, apod_data: Dict[str, Any], apod_date: str
+    ) -> Dict[str, str]:
+        payload_key = self._build_push_payload_cache_key(apod_date)
+        cached_payload = await self.get_cache(payload_key)
+        if isinstance(cached_payload, dict):
+            cached_date = str(cached_payload.get("date", "")).strip()
+            if cached_date == apod_date:
+                return {
+                    "url": str(cached_payload.get("url", "")).strip(),
+                    "title": str(cached_payload.get("title", "")).strip(),
+                    "date": cached_date,
+                    "explanation": str(cached_payload.get("explanation", "")).strip(),
+                }
+
+        payload = await self._build_display_payload(apod_data)
+        await self.put_cache(payload_key, payload)
+        return payload
+
+    async def _run_push_once(self):
+        targets = self._get_round_targets()
+        if not targets:
+            logger.info("自动推送任务：当前未配置可用 target_unified_msg_origins，跳过本轮。")
+            return
+
+        if self._needs_translation() and not self.provider:
+            logger.warning("自动推送任务：已启用翻译但未配置 provider，跳过本轮。")
+            return
+
+        apod_data = await self.get_cache_apod()
+        if not apod_data:
+            logger.warning(
+                f"自动推送任务：拉取 APOD 失败，原因：{self.last_apod_error or '未知错误'}"
+            )
+            return
+
+        apod_date = str(apod_data.get("date", "")).strip()
+        if not apod_date:
+            logger.warning("自动推送任务：APOD 数据缺少 date，跳过本轮。")
+            return
+
+        last_sent_date = await self.get_cache(self.PUSH_LAST_SENT_DATE_KEY)
+        if str(last_sent_date).strip() == apod_date:
+            logger.info(f"自动推送任务：{apod_date} 已推送过，跳过重复推送。")
+            return
+
+        validation_error = self._validate_apod_output(apod_data)
+        if validation_error:
+            logger.warning(f"自动推送任务：{validation_error}")
+            return
+
+        payload = await self._get_or_build_push_payload(apod_data, apod_date)
+        success_count = 0
+        chain = self._build_chain_from_payload(payload)
+        if not chain:
+            logger.warning("自动推送任务：当前配置未启用任何可发送内容，跳过本轮。")
+            return
+
+        for target in targets:
+            try:
+                msg_list = self._build_chain_from_payload(payload)
+                # 包装为 MessageChain（框架需要具有 .chain 属性的对象）
+                msg = MessageChain(msg_list)
+                logger.debug(
+                    "send_message target=%s type=%s has_chain=%s",
+                    target,
+                    type(msg),
+                    hasattr(msg, "chain"),
+                )
+                await self.context.send_message(target, msg)
+                success_count += 1
+            except Exception as exc:
+                logger.error(f"自动推送任务：向会话 {target} 发送失败：{exc}")
+
+        if success_count > 0:
+            await self.put_cache(self.PUSH_LAST_SENT_DATE_KEY, apod_date)
+            logger.info(
+                f"自动推送任务：{apod_date} 推送完成，成功 {success_count}/{len(targets)}。"
+            )
+        else:
+            logger.warning("自动推送任务：本轮所有目标发送失败，不更新已推送日期。")
+
+    async def _push_loop(self):
+        logger.info("APOD 自动推送定时任务已进入运行状态。")
+        while True:
+            wait_seconds = self._seconds_until_next_daily_push()
+            next_run_at = (datetime.now() + timedelta(seconds=wait_seconds)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            logger.info(
+                f"APOD 自动推送定时任务：下次将在 {next_run_at} 执行（配置时间 {self.daily_push_time}）。"
+            )
+            try:
+                await asyncio.sleep(wait_seconds)
+                await self._run_push_once()
+            except asyncio.CancelledError:
+                logger.info("APOD 自动推送任务已取消。")
+                raise
+            except Exception as exc:
+                logger.error(f"APOD 自动推送定时任务发生异常：{exc}")
+
+    @filter.command("apod")
+    async def apod(self, event: AstrMessageEvent):
+        logger.info("正在获取 NASA 每日天文图片...")
+
+        if self._needs_translation() and not self.provider:
+            logger.warning(
+                "已启用翻译功能，但未配置 provider，请在插件配置中填写 `provider` 字段。"
+            )
+            yield event.plain_result(
+                "已启用翻译功能，但未配置 provider，请在插件配置中填写 provider 字段。"
+            )
+            return
+
+        # 如果今天的 APOD 缓存仍然有效，就优先复用缓存数据。
+        apod_data = await self.get_cache_apod()
+        if not apod_data:
+            yield event.plain_result(
+                self.last_apod_error or "获取 APOD 数据失败，请稍后重试。"
+            )
+            return
+
+        validation_error = self._validate_apod_output(apod_data)
+        if validation_error:
+            yield event.plain_result(validation_error)
+            return
+
+        payload = await self._build_display_payload(apod_data)
 
         # 如果配置为分开发送，就把内容拆成多条消息返回。
         if self.is_divided:
             has_output = False
 
-            if self.image and url:
+            if self.image and payload.get("url"):
                 has_output = True
-                yield event.image_result(url)
-            if self.title.get("is_show") and display_title:
+                yield event.image_result(payload["url"])
+            if self.title.get("is_show") and payload.get("title"):
                 has_output = True
-                yield event.plain_result(f"标题：{display_title}")
-            if self.date.get("is_show") and display_date:
+                yield event.plain_result(f"标题：{payload['title']}")
+            if self.date.get("is_show") and payload.get("date"):
                 has_output = True
-                yield event.plain_result(f"日期：{display_date}")
-            if self.explanation.get("is_show") and display_explanation:
+                yield event.plain_result(f"日期：{payload['date']}")
+            if self.explanation.get("is_show") and payload.get("explanation"):
                 has_output = True
-                yield event.plain_result(display_explanation)
+                yield event.plain_result(payload["explanation"])
             if not has_output:
                 yield event.plain_result("当前配置未启用任何可返回的内容。")
             return
 
         # 否则把所有内容拼成一条消息链返回。
-        chain = []
-        if self.image and url:
-            chain.append(Comp.Image.fromURL(url))
-        if self.title.get("is_show") and display_title:
-            chain.append(Comp.Plain(f"标题：{display_title}\n"))
-        if self.date.get("is_show") and display_date:
-            chain.append(Comp.Plain(f"日期：{display_date}\n"))
-        if self.explanation.get("is_show") and display_explanation:
-            chain.append(Comp.Plain(display_explanation))
-
+        chain = self._build_chain_from_payload(payload)
         if not chain:
             yield event.plain_result("当前配置未启用任何可返回的内容。")
             return
 
         yield event.chain_result(chain)
 
-    # 插件自带的 KV 存储足够保存 APOD 数据和翻译结果。
+    # 插件自带的 KV 存储足够保存 APOD 数据、推送状态和翻译结果。
     async def put_cache(self, key: str, value: Any):
         logger.info(f"正在写入缓存，键：{key}")
         try:
@@ -222,12 +414,12 @@ class APOD(Star):
             return None
 
         apod_data["retrieved_at"] = datetime.now().isoformat()
-        await self.put_cache("apod_cache", apod_data)
+        await self.put_cache(self.APOD_CACHE_KEY, apod_data)
         return apod_data
 
     # 只有在缓存结构有效且时间未过期时，才真正使用缓存。
     async def get_cache_apod(self) -> Optional[dict]:
-        apod_data = await self.get_cache("apod_cache")
+        apod_data = await self.get_cache(self.APOD_CACHE_KEY)
         if apod_data is None:
             return await self._fetch_and_cache_apod()
 
@@ -327,3 +519,9 @@ class APOD(Star):
 
     async def terminate(self):
         logger.info("正在终止 NASA APOD 插件...")
+        if self.push_task and not self.push_task.done():
+            self.push_task.cancel()
+            try:
+                await self.push_task
+            except asyncio.CancelledError:
+                pass
