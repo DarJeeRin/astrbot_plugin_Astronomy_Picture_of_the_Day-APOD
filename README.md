@@ -2,12 +2,14 @@
 
 AstrBot 的 NASA Astronomy Picture of the Day 插件。
 
-插件会通过 NASA APOD API 获取当天的每日天文图片，并按配置返回图片、标题、日期和说明文本；也支持调用 AstrBot 已配置的 LLM 提供商将标题和说明翻译为简体中文。
+插件会通过 NASA APOD API 获取当天的每日天文图片或视频，并按配置返回媒体、标题、日期和说明文本；也支持调用 AstrBot 已配置的 LLM 提供商将标题和说明翻译为简体中文。
 
 ## 功能简介
 
 - 通过 `apod` 指令获取 NASA 每日天文图片
 - 支持返回图片、标题、日期、说明
+- 支持下载并发送 MP4、WebM、MOV、M4V 视频直链
+- YouTube、Vimeo 等页面型视频外链返回缩略图和原始链接
 - 支持将标题和说明翻译为简体中文
 - 支持分段发送或合并为一条消息链发送
 - 支持按 UMO 列表定向自动推送到指定群聊/会话
@@ -56,6 +58,23 @@ NASA API Token，用于访问 APOD API。
 
 - 类型：`bool`
 - 默认值：`true`
+
+### `video`
+
+视频处理配置。
+
+- 类型：`object`
+
+子项：
+
+- `download`：是否下载并发送视频直链，类型为 `bool`，默认 `false`
+- `max_download_mb`：单个视频最大下载大小，类型为 `int`，默认 `100`
+
+说明：
+
+- 仅 MP4、WebM、MOV、M4V 等直链会进入下载流程
+- YouTube、Vimeo 等页面外链不会抓取或解析，始终返回 NASA 提供的缩略图和原始链接
+- 视频超过大小上限、下载超时或失败时，会自动回退为缩略图和链接
 
 ### `explanation`
 
@@ -152,6 +171,10 @@ NASA API 临时错误时的重试次数。
 {
   "token": "YOUR_NASA_API_TOKEN",
   "image": true,
+  "video": {
+    "download": false,
+    "max_download_mb": 100
+  },
   "explanation": {
     "is_show": true,
     "is_translate": true
@@ -183,11 +206,13 @@ NASA API 临时错误时的重试次数。
 根据配置不同，插件会返回以下内容中的一部分：
 
 - 图片：优先使用 `hdurl`，若不存在则回退到 `url`
+- 直链视频：开启 `video.download` 后下载并作为视频消息发送
+- 外链视频：返回 `thumbnail_url` 缩略图和原始视频链接
 - 标题：原文或翻译后的中文标题
 - 日期：APOD 对应日期
 - 说明：原文或翻译后的中文说明
 
-如果当天 APOD 不是图片类型，而你又开启了 `image`，插件会直接返回错误提示，而不是继续发送文本内容。
+NASA API 请求会启用 `thumbs=true`，以便视频类型 APOD 返回缩略图。无法下载的视频会安全回退为缩略图和链接，不影响标题、日期和说明的发送。
 
 ## 缓存机制
 
@@ -242,7 +267,7 @@ NASA API 临时错误时的重试次数。
 
 ## 项目地址
 
-- Repository: <https://github.com/Cysheper/astrbot_plugin_Astronomy_Picture_of_the_Day-APOD>
+- Repository: <https://github.com/DarJeeRin/astrbot_plugin_Astronomy_Picture_of_the_Day-APOD>
 
 ## 致谢
 

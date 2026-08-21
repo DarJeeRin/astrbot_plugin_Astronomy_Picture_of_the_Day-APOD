@@ -1,8 +1,13 @@
 # ruff: noqa: UP006, UP035, UP045
 import asyncio
 import hashlib
+import os
+import re
+import tempfile
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 
@@ -20,11 +25,27 @@ except Exception:
             self.chain = chain
 
 
-@register("apod", "Cysheper", "NASA APOD plugin", "0.0.1")
+@register("apod", "Cysheper", "NASA APOD plugin", "0.0.2")
 class APOD(Star):
     APOD_CACHE_KEY = "apod_cache"
     PUSH_LAST_SENT_DATE_KEY = "apod_push:last_sent_date"
     PUSH_PAYLOAD_KEY_PREFIX = "apod_push:last_payload:"
+    DIRECT_VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm"}
+    EXTERNAL_VIDEO_PAGE_HOSTS = {
+        "b23.tv",
+        "bilibili.com",
+        "dailymotion.com",
+        "vimeo.com",
+        "youtu.be",
+        "youtube.com",
+        "youtube-nocookie.com",
+    }
+    VIDEO_CONTENT_TYPE_EXTENSIONS = {
+        "video/mp4": ".mp4",
+        "video/quicktime": ".mov",
+        "video/webm": ".webm",
+        "video/x-m4v": ".m4v",
+    }
 
     def __init__(self, context: Context, config: AstrBotConfig):
         self.config = config
@@ -105,6 +126,11 @@ class APOD(Star):
             logger.warning("未配置 NASA API Token，请在插件配置中填写 `token` 字段。")
 
         self.image = self.config.get("image", True)
+        self.video = self._ensure_dict(self.config.get("video", {}))
+        self.video_download = bool(self.video.get("download", False))
+        self.video_max_download_mb = max(
+            1, int(self.video.get("max_download_mb", 100))
+        )
         self.explanation = self._ensure_dict(self.config.get("explanation", {}))
         self.title = self._ensure_dict(self.config.get("title", {}))
         self.provider = self.config.get("provider", "")
@@ -142,17 +168,151 @@ class APOD(Star):
             logger.info("APOD 自动推送已禁用。")
 
     def _validate_apod_output(self, apod_data: Dict[str, Any]) -> Optional[str]:
-        if apod_data.get("media_type") != "image" and self.image:
-            return "今天的 APOD 不是图片类型，请稍后再试。"
-        url = apod_data.get("hdurl", apod_data.get("url"))
+        media_type = str(apod_data.get("media_type", "image")).strip().lower()
+        if media_type == "image":
+            url = apod_data.get("hdurl") or apod_data.get("url")
+        elif media_type == "video":
+            url = apod_data.get("url")
+            if not url:
+                return "获取 APOD 视频链接失败，请稍后重试。"
+            return None
+        else:
+            return f"暂不支持今天的 APOD 媒体类型：{media_type or '未知'}。"
+
         if self.image and not url:
             return "获取 APOD 图片链接失败，请稍后重试。"
         return None
 
+    @classmethod
+    def _is_direct_video_url(cls, url: str) -> bool:
+        path = urlparse(url).path.lower()
+        return Path(path).suffix in cls.DIRECT_VIDEO_EXTENSIONS
+
+    @classmethod
+    def _is_external_video_page_url(cls, url: str) -> bool:
+        hostname = (urlparse(url).hostname or "").lower()
+        return any(
+            hostname == domain or hostname.endswith(f".{domain}")
+            for domain in cls.EXTERNAL_VIDEO_PAGE_HOSTS
+        )
+
+    @classmethod
+    def _video_suffix(cls, url: str, content_type: str = "") -> str:
+        url_suffix = Path(urlparse(url).path).suffix.lower()
+        if url_suffix in cls.DIRECT_VIDEO_EXTENSIONS:
+            return url_suffix
+        normalized_content_type = content_type.split(";", 1)[0].strip().lower()
+        return cls.VIDEO_CONTENT_TYPE_EXTENSIONS.get(normalized_content_type, ".mp4")
+
+    @staticmethod
+    def _youtube_thumbnail_url(url: str) -> str:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+        video_id = ""
+        if hostname == "youtu.be" or hostname.endswith(".youtu.be"):
+            video_id = parsed.path.strip("/").split("/", 1)[0]
+        elif hostname == "youtube.com" or hostname.endswith(".youtube.com"):
+            path_parts = [part for part in parsed.path.split("/") if part]
+            if len(path_parts) >= 2 and path_parts[0] in {"embed", "shorts", "live"}:
+                video_id = path_parts[1]
+            else:
+                video_id = parse_qs(parsed.query).get("v", [""])[0]
+
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6,}", video_id):
+            return ""
+        return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+    async def _download_video(self, url: str) -> Optional[str]:
+        if (
+            not self.video_download
+            or not url
+            or self._is_external_video_page_url(url)
+        ):
+            return None
+
+        max_bytes = self.video_max_download_mb * 1024 * 1024
+        temp_path: Optional[str] = None
+        try:
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, allow_redirects=True) as response:
+                    if response.status >= 400:
+                        logger.warning(
+                            f"下载 APOD 视频失败：HTTP {response.status}，将返回视频链接。"
+                        )
+                        return None
+
+                    content_type = response.headers.get("Content-Type", "")
+                    normalized_content_type = content_type.split(";", 1)[0].strip().lower()
+                    allowed_generic_types = {
+                        "application/octet-stream",
+                        "binary/octet-stream",
+                    }
+                    if normalized_content_type and not (
+                        normalized_content_type.startswith("video/")
+                        or normalized_content_type in allowed_generic_types
+                    ):
+                        logger.warning(
+                            "APOD 视频地址返回的内容不是视频，将返回缩略图和链接。"
+                        )
+                        return None
+                    if not normalized_content_type and not self._is_direct_video_url(
+                        str(response.url)
+                    ):
+                        logger.warning(
+                            "APOD 视频地址不是可下载的视频直链，将返回缩略图和链接。"
+                        )
+                        return None
+                    content_length = response.headers.get("Content-Length")
+                    if content_length and int(content_length) > max_bytes:
+                        logger.warning(
+                            f"APOD 视频超过下载上限 {self.video_max_download_mb} MB，将返回视频链接。"
+                        )
+                        return None
+
+                    suffix = self._video_suffix(str(response.url), content_type)
+                    fd, temp_path = tempfile.mkstemp(prefix="astrbot_apod_", suffix=suffix)
+                    downloaded = 0
+                    with os.fdopen(fd, "wb") as video_file:
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            downloaded += len(chunk)
+                            if downloaded > max_bytes:
+                                raise ValueError(
+                                    f"视频超过下载上限 {self.video_max_download_mb} MB"
+                                )
+                            video_file.write(chunk)
+            return temp_path
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
+            logger.warning(f"下载 APOD 视频失败，将返回视频链接：{exc}")
+            if temp_path:
+                self._remove_temp_file(temp_path)
+            return None
+
+    @staticmethod
+    def _remove_temp_file(path: Optional[str]):
+        if not path:
+            return
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(f"清理 APOD 临时视频失败：{exc}")
+
     async def _build_display_payload(self, apod_data: Dict[str, Any]) -> Dict[str, str]:
         explanation = apod_data.get("explanation")
         title = apod_data.get("title")
-        url = apod_data.get("hdurl", apod_data.get("url"))
+        media_type = str(apod_data.get("media_type", "image")).strip().lower()
+        media_url = (
+            apod_data.get("hdurl") or apod_data.get("url")
+            if media_type == "image"
+            else apod_data.get("url")
+        )
+        thumbnail_url = ""
+        if media_type == "video":
+            thumbnail_url = apod_data.get("thumbnail_url") or self._youtube_thumbnail_url(
+                str(media_url or "")
+            )
         apod_date = apod_data.get("date")
 
         explanation_zh, title_zh = None, None
@@ -193,16 +353,30 @@ class APOD(Star):
             logger.error(f"翻译 APOD 内容失败：{exc}")
 
         return {
-            "url": str(url).strip() if url else "",
+            "url": str(media_url).strip() if media_url else "",
+            "media_type": media_type,
+            "media_url": str(media_url).strip() if media_url else "",
+            "thumbnail_url": str(thumbnail_url).strip() if thumbnail_url else "",
             "title": (title_zh or title or "").strip(),
             "date": str(apod_date).strip() if apod_date else "",
             "explanation": (explanation_zh or explanation or "").strip(),
         }
 
-    def _build_chain_from_payload(self, payload: Dict[str, str]) -> List[Any]:
+    def _build_chain_from_payload(
+        self, payload: Dict[str, str], video_path: Optional[str] = None
+    ) -> List[Any]:
         chain = []
-        if self.image and payload.get("url"):
-            chain.append(Comp.Image.fromURL(payload["url"]))
+        media_type = payload.get("media_type", "image")
+        media_url = payload.get("media_url") or payload.get("url", "")
+        if media_type == "image" and self.image and media_url:
+            chain.append(Comp.Image.fromURL(media_url))
+        elif media_type == "video":
+            if payload.get("thumbnail_url"):
+                chain.append(Comp.Image.fromURL(payload["thumbnail_url"]))
+            if video_path:
+                chain.append(Comp.Video.fromFileSystem(path=video_path))
+            elif media_url:
+                chain.append(Comp.Plain(f"视频链接：{media_url}\n"))
         if self.title.get("is_show") and payload.get("title"):
             chain.append(Comp.Plain(f"标题：{payload['title']}\n"))
         if self.date.get("is_show") and payload.get("date"):
@@ -222,11 +396,20 @@ class APOD(Star):
     ) -> Dict[str, str]:
         payload_key = self._build_push_payload_cache_key(apod_date)
         cached_payload = await self.get_cache(payload_key)
-        if isinstance(cached_payload, dict):
+        if isinstance(cached_payload, dict) and cached_payload.get("media_type"):
             cached_date = str(cached_payload.get("date", "")).strip()
             if cached_date == apod_date:
                 return {
                     "url": str(cached_payload.get("url", "")).strip(),
+                    "media_type": str(
+                        cached_payload.get("media_type", "image")
+                    ).strip(),
+                    "media_url": str(
+                        cached_payload.get("media_url", cached_payload.get("url", ""))
+                    ).strip(),
+                    "thumbnail_url": str(
+                        cached_payload.get("thumbnail_url", "")
+                    ).strip(),
                     "title": str(cached_payload.get("title", "")).strip(),
                     "date": cached_date,
                     "explanation": str(cached_payload.get("explanation", "")).strip(),
@@ -270,26 +453,31 @@ class APOD(Star):
 
         payload = await self._get_or_build_push_payload(apod_data, apod_date)
         success_count = 0
-        chain = self._build_chain_from_payload(payload)
-        if not chain:
-            logger.warning("自动推送任务：当前配置未启用任何可发送内容，跳过本轮。")
-            return
+        media_url = payload.get("media_url") or payload.get("url", "")
+        video_path = await self._download_video(media_url)
+        try:
+            chain = self._build_chain_from_payload(payload, video_path)
+            if not chain:
+                logger.warning("自动推送任务：当前配置未启用任何可发送内容，跳过本轮。")
+                return
 
-        for target in targets:
-            try:
-                msg_list = self._build_chain_from_payload(payload)
-                # 包装为 MessageChain（框架需要具有 .chain 属性的对象）
-                msg = MessageChain(msg_list)
-                logger.debug(
-                    "send_message target=%s type=%s has_chain=%s",
-                    target,
-                    type(msg),
-                    hasattr(msg, "chain"),
-                )
-                await self.context.send_message(target, msg)
-                success_count += 1
-            except Exception as exc:
-                logger.error(f"自动推送任务：向会话 {target} 发送失败：{exc}")
+            for target in targets:
+                try:
+                    msg_list = self._build_chain_from_payload(payload, video_path)
+                    # 包装为 MessageChain（框架需要具有 .chain 属性的对象）
+                    msg = MessageChain(msg_list)
+                    logger.debug(
+                        "send_message target=%s type=%s has_chain=%s",
+                        target,
+                        type(msg),
+                        hasattr(msg, "chain"),
+                    )
+                    await self.context.send_message(target, msg)
+                    success_count += 1
+                except Exception as exc:
+                    logger.error(f"自动推送任务：向会话 {target} 发送失败：{exc}")
+        finally:
+            self._remove_temp_file(video_path)
 
         if success_count > 0:
             await self.put_cache(self.PUSH_LAST_SENT_DATE_KEY, apod_date)
@@ -345,34 +533,52 @@ class APOD(Star):
             return
 
         payload = await self._build_display_payload(apod_data)
+        media_type = payload.get("media_type", "image")
+        media_url = payload.get("media_url") or payload.get("url", "")
+        video_path = await self._download_video(media_url)
 
-        # 如果配置为分开发送，就把内容拆成多条消息返回。
-        if self.is_divided:
-            has_output = False
+        try:
+            # 如果配置为分开发送，就把内容拆成多条消息返回。
+            if self.is_divided:
+                has_output = False
 
-            if self.image and payload.get("url"):
-                has_output = True
-                yield event.image_result(payload["url"])
-            if self.title.get("is_show") and payload.get("title"):
-                has_output = True
-                yield event.plain_result(f"标题：{payload['title']}")
-            if self.date.get("is_show") and payload.get("date"):
-                has_output = True
-                yield event.plain_result(f"日期：{payload['date']}")
-            if self.explanation.get("is_show") and payload.get("explanation"):
-                has_output = True
-                yield event.plain_result(payload["explanation"])
-            if not has_output:
+                if media_type == "image" and self.image and media_url:
+                    has_output = True
+                    yield event.image_result(media_url)
+                elif media_type == "video":
+                    if payload.get("thumbnail_url"):
+                        has_output = True
+                        yield event.image_result(payload["thumbnail_url"])
+                    if video_path:
+                        has_output = True
+                        yield event.chain_result(
+                            [Comp.Video.fromFileSystem(path=video_path)]
+                        )
+                    elif media_url:
+                        has_output = True
+                        yield event.plain_result(f"视频链接：{media_url}")
+                if self.title.get("is_show") and payload.get("title"):
+                    has_output = True
+                    yield event.plain_result(f"标题：{payload['title']}")
+                if self.date.get("is_show") and payload.get("date"):
+                    has_output = True
+                    yield event.plain_result(f"日期：{payload['date']}")
+                if self.explanation.get("is_show") and payload.get("explanation"):
+                    has_output = True
+                    yield event.plain_result(payload["explanation"])
+                if not has_output:
+                    yield event.plain_result("当前配置未启用任何可返回的内容。")
+                return
+
+            # 否则把所有内容拼成一条消息链返回。
+            chain = self._build_chain_from_payload(payload, video_path)
+            if not chain:
                 yield event.plain_result("当前配置未启用任何可返回的内容。")
-            return
+                return
 
-        # 否则把所有内容拼成一条消息链返回。
-        chain = self._build_chain_from_payload(payload)
-        if not chain:
-            yield event.plain_result("当前配置未启用任何可返回的内容。")
-            return
-
-        yield event.chain_result(chain)
+            yield event.chain_result(chain)
+        finally:
+            self._remove_temp_file(video_path)
 
     # 插件自带的 KV 存储足够保存 APOD 数据、推送状态和翻译结果。
     async def put_cache(self, key: str, value: Any):
@@ -414,6 +620,7 @@ class APOD(Star):
             return None
 
         apod_data["retrieved_at"] = datetime.now().isoformat()
+        apod_data["thumbnail_requested"] = True
         await self.put_cache(self.APOD_CACHE_KEY, apod_data)
         return apod_data
 
@@ -425,6 +632,14 @@ class APOD(Star):
 
         if not self._is_valid_apod_data(apod_data):
             logger.warning("缓存中的 APOD 数据无效，正在刷新缓存。")
+            return await self._fetch_and_cache_apod()
+
+        if (
+            str(apod_data.get("media_type", "")).strip().lower() == "video"
+            and not apod_data.get("thumbnail_url")
+            and not apod_data.get("thumbnail_requested")
+        ):
+            logger.info("缓存中的视频 APOD 缺少缩略图，正在刷新缓存。")
             return await self._fetch_and_cache_apod()
 
         retrieved_at_raw = apod_data.get("retrieved_at")
@@ -455,7 +670,9 @@ class APOD(Star):
             )
             return None
 
-        base_url = f"https://api.nasa.gov/planetary/apod?api_key={self.token}"
+        base_url = (
+            f"https://api.nasa.gov/planetary/apod?api_key={self.token}&thumbs=true"
+        )
         retryable_statuses = {502, 503, 504}
         self.last_apod_error = None
         timeout = aiohttp.ClientTimeout(total=self.timeout)
