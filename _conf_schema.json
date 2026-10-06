@@ -1,7 +1,7 @@
 {
     "token": {
-        "description": "NASA API Token",
-        "hint": "访问 NASA APOD API 所需的密钥，可以在 https://api.nasa.gov/ 申请",
+        "description": "旧版 NASA API Token（已停用）",
+        "hint": "仅为兼容旧配置保留；迁移后的 NASA APOD 公共接口无需 Token，此字段不再使用",
         "type": "string"
     },
     "image": {
@@ -101,6 +101,30 @@
                 "description": "单轮最多推送的会话数量，0 表示不限制",
                 "type": "int",
                 "default": 0
+            }
+        }
+    },
+    "video": {
+        "description": "视频配置",
+        "type": "object",
+        "items": {
+            "download": {
+                "description": "是否下载并发送直链视频",
+                "hint": "仅下载 MP4、WebM、MOV、M4V 等视频直链；YouTube、Vimeo 等页面外链始终返回缩略图和原始链接",
+                "type": "bool",
+                "default": false
+            },
+            "max_download_mb": {
+                "description": "单个视频最大下载大小（MB）",
+                "hint": "超过上限或下载失败时会自动回退为缩略图和视频链接",
+                "type": "int",
+                "default": 100
+            },
+            "download_timeout": {
+                "description": "视频下载总超时（秒）",
+                "hint": "独立于 NASA 数据请求 timeout；低带宽可适当增大，失败日志包含已下载字节和耗时",
+                "type": "int",
+                "default": 120
             }
         }
     }

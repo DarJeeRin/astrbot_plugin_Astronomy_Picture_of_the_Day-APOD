@@ -1,0 +1,2 @@
+# Tested development framework; runtime dependencies are provided by AstrBot.
+astrbot==4.28.2
