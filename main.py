@@ -29,6 +29,10 @@ class _APODHTMLParser(HTMLParser):
         self.text = []
         self.images = []
         self.videos = []
+        self.video_sources = []
+        self.links = []
+        self.meta_videos = []
+        self.anchor = None
         self.hidden_depth = 0
 
     def handle_starttag(self, tag, attrs):
@@ -38,6 +42,12 @@ class _APODHTMLParser(HTMLParser):
             return
         if tag in {"p", "br", "div", "li"}:
             self.text.append(" ")
+        if tag == "a":
+            self.anchor = [dict(attrs).get("href", ""), []]
+        if tag == "meta":
+            data = dict(attrs)
+            if data.get("property") in {"og:video", "og:video:url", "og:video:secure_url"}:
+                self.meta_videos.append(data.get("content", ""))
         if tag == "img":
             src = dict(attrs).get("src")
             if src:
@@ -47,8 +57,13 @@ class _APODHTMLParser(HTMLParser):
             src = dict(attrs).get("src")
             if src:
                 self.videos.append(src)
+                if tag in {"source", "video"}:
+                    self.video_sources.append(src)
 
     def handle_endtag(self, tag):
+        if tag == "a" and self.anchor is not None:
+            self.links.append((self.anchor[0], "".join(self.anchor[1]).strip()))
+            self.anchor = None
         if tag in {"script", "style"} and self.hidden_depth:
             self.hidden_depth -= 1
         if tag in {"p", "div", "li"}:
@@ -57,11 +72,17 @@ class _APODHTMLParser(HTMLParser):
     def handle_data(self, data):
         if not self.hidden_depth:
             self.text.append(data)
+            if self.anchor is not None:
+                self.anchor[1].append(data)
 
 
 def _log_url(url: str) -> str:
     # Omit query strings, fragments and userinfo (URLs can contain credentials).
+    if not url:
+        return ""
     parsed = urlparse(url)
+    if not parsed.scheme or parsed.scheme == "file":
+        return f"file://{parsed.path}"
     return f"{parsed.scheme}://{parsed.hostname or ''}{parsed.path}"
 
 
@@ -95,12 +116,12 @@ class _LoggedImage(Comp.Image):
             raise
 
 
-@register("apod", "Cysheper", "NASA APOD plugin", "0.1.2")
+@register("apod", "Cysheper", "NASA APOD plugin", "0.1.3")
 class APOD(Star):
     APOD_API_URL = "https://science.nasa.gov/wp-json/wp/v2/apod-basic"
-    APOD_CACHE_KEY = "apod_cache:v3"
+    APOD_CACHE_KEY = "apod_cache:v4"
     PUSH_LAST_SENT_DATE_KEY = "apod_push:last_sent_date"
-    PUSH_PAYLOAD_KEY_PREFIX = "apod_push:last_payload:v3:"
+    PUSH_PAYLOAD_KEY_PREFIX = "apod_push:last_payload:v4:"
 
     DIRECT_VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm"}
     EXTERNAL_VIDEO_PAGE_HOSTS = {
@@ -213,6 +234,23 @@ class APOD(Star):
         normalized["media_type"] = media_type
         normalized["media_url"] = image_url if media_type == "image" else ""
         normalized["thumbnail_url"] = ""
+        normalized["external_media_url"] = ""
+        explanation_parser = _APODHTMLParser()
+        explanation_parser.feed(data["explanation"])
+        links = sorted(
+            explanation_parser.links,
+            key=lambda item: not bool(re.fullmatch(
+                r"featured (?:video|animation|movie|gif)", " ".join(item[1].split()), re.I
+            )),
+        )
+        for href, label in links:
+            label = " ".join(label.split())
+            href = urljoin(cls._http_url(data.get("permalink")) or cls.APOD_API_URL, href)
+            if re.fullmatch(r"featured (?:video|animation|movie|gif)", label, re.I) or cls._direct_media_type(href):
+                candidate = cls._http_url(href)
+                if candidate:
+                    normalized["external_media_url"] = candidate
+                    break
         if media_type == "video":
             parser = _APODHTMLParser()
             parser.feed(data.get("basic_html") if isinstance(data.get("basic_html"), str) else "")
@@ -270,6 +308,10 @@ class APOD(Star):
         self.video_download = bool(self.video.get("download", False))
         self.video_max_download_mb = max(1, int(self.video.get("max_download_mb", 100)))
         self.video_download_timeout = max(1, int(self.video.get("download_timeout", 120)))
+        external = self._ensure_dict(self.config.get("external_media", {}))
+        self.external_media_enabled = bool(external.get("enabled", True))
+        self.external_media_timeout = max(1, int(external.get("download_timeout", 120)))
+        self.external_media_max_mb = max(1, int(external.get("max_download_mb", 100)))
         self.explanation = self._ensure_dict(self.config.get("explanation", {}))
         self.title = self._ensure_dict(self.config.get("title", {}))
         self.provider = self.config.get("provider", "")
@@ -357,20 +399,90 @@ class APOD(Star):
             return ""
         return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
 
+    @classmethod
+    def _direct_media_type(cls, url: str) -> str:
+        suffix = Path(urlparse(url).path).suffix.lower()
+        if suffix == ".gif":
+            return "gif"
+        return "video" if suffix in cls.DIRECT_VIDEO_EXTENSIONS else ""
+
+    async def _resolve_external_media(self, url: str):
+        """Read one media page; do not crawl its unrelated links or execute JS."""
+        direct_type = self._direct_media_type(url)
+        if direct_type:
+            return url, direct_type
+        if self._is_external_video_page_url(url):
+            return url, "video"  # Existing unsupported-player link fallback.
+        started = time.monotonic()
+        try:
+            timeout = aiohttp.ClientTimeout(total=self.external_media_timeout)
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.get(url, allow_redirects=True) as response:
+                    response.raise_for_status()
+                    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                    if content_type == "image/gif":
+                        return str(response.url), "gif"
+                    if content_type.startswith("video/"):
+                        return str(response.url), "video"
+                    if content_type not in {"text/html", "application/xhtml+xml"}:
+                        raise ValueError(f"不支持的外链响应 Content-Type={content_type}")
+                    # Bound HTML reads, including chunked responses without Content-Length.
+                    body = bytearray()
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        body.extend(chunk)
+                        if len(body) > 2 * 1024 * 1024:
+                            raise ValueError("外链页面超过 2 MB 解析上限")
+                    base_url = str(response.url)
+                    text = body.decode(response.charset or "utf-8", errors="replace")
+            parser = _APODHTMLParser()
+            parser.feed(text)
+            # Prefer original download links to preview GIFs in img/og:image.
+            candidates = (
+                [(src, "video") for src in parser.video_sources + parser.meta_videos]
+                + [(href, "") for href, _ in parser.links]
+                + [(src, "") for src in parser.images]
+            )
+            for candidate, declared_type in candidates:
+                candidate = self._http_url(urljoin(base_url, candidate))
+                if not candidate:
+                    continue
+                kind = self._direct_media_type(candidate) or declared_type
+                if kind:
+                    logger.info(f"APOD 外链解析完成 source={_log_url(url)} media={kind} url={_log_url(candidate)}")
+                    return candidate, kind
+            raise ValueError("外链页面没有可直接下载的 GIF 或视频文件")
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, LookupError) as exc:
+            logger.error(
+                f"APOD 媒体失败 stage=external_resolve url={_log_url(url)} "
+                f"elapsed={time.monotonic() - started:.2f}s timeout={self.external_media_timeout}s "
+                f"error={type(exc).__name__} detail={_log_error(exc)}；保留原图与外链"
+            )
+            return None
+
     async def _download_video(self, url: str) -> Optional[str]:
-        if not self.video_download or not url or self._is_external_video_page_url(url):
-            reason = "disabled" if not self.video_download else "external_page" if url else "missing_url"
+        return await self._download_media(url, "video")
+
+    async def _download_gif(self, url: str) -> Optional[str]:
+        return await self._download_media(url, "gif")
+
+    async def _download_media(self, url: str, media_type: str) -> Optional[str]:
+        enabled = (self.image and self.external_media_enabled) if media_type == "gif" else self.video_download
+        timeout_seconds = self.external_media_timeout if media_type == "gif" else self.video_download_timeout
+        max_mb = self.external_media_max_mb if media_type == "gif" else self.video_max_download_mb
+        stage = "gif_download" if media_type == "gif" else "video_download"
+        if not enabled or not url or self._is_external_video_page_url(url):
+            reason = "disabled" if not enabled else "external_page" if url else "missing_url"
             logger.info(f"APOD 视频不下载 stage=download_skipped reason={reason} url={_log_url(url)}")
             return None
 
-        max_bytes = self.video_max_download_mb * 1024 * 1024
+        max_bytes = max_mb * 1024 * 1024
         temp_path: Optional[str] = None
         started = time.monotonic()
         downloaded = 0
         content_length = None
-        logger.info(f"APOD 视频下载开始 url={_log_url(url)} timeout={self.video_download_timeout}s limit={self.video_max_download_mb}MB")
+        logger.info(f"APOD 媒体下载开始 media={media_type} url={_log_url(url)} timeout={timeout_seconds}s limit={max_mb}MB")
         try:
-            timeout = aiohttp.ClientTimeout(total=self.video_download_timeout)
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
             async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
                 async with session.get(url, allow_redirects=True) as response:
                     if response.status >= 400:
@@ -383,19 +495,17 @@ class APOD(Star):
                         "binary/octet-stream",
                     }
                     if normalized_content_type and not (
-                        normalized_content_type.startswith("video/")
+                        (normalized_content_type == "image/gif" if media_type == "gif" else normalized_content_type.startswith("video/"))
                         or normalized_content_type in allowed_generic_types
                     ):
-                        raise ValueError(f"非视频响应 Content-Type={normalized_content_type}")
-                    if not normalized_content_type and not self._is_direct_video_url(
-                        str(response.url)
-                    ):
-                        raise ValueError("非视频直链且缺少 Content-Type")
+                        raise ValueError(f"媒体响应类型不匹配 Content-Type={normalized_content_type}")
+                    if not normalized_content_type and self._direct_media_type(str(response.url)) != media_type:
+                        raise ValueError("非媒体直链且缺少 Content-Type")
                     content_length = response.headers.get("Content-Length")
                     if content_length and int(content_length) > max_bytes:
-                        raise ValueError(f"Content-Length={content_length} 超过下载上限 {self.video_max_download_mb} MB")
+                        raise ValueError(f"Content-Length={content_length} 超过下载上限 {max_mb} MB")
 
-                    suffix = self._video_suffix(str(response.url), content_type)
+                    suffix = ".gif" if media_type == "gif" else self._video_suffix(str(response.url), content_type)
                     fd, temp_path = tempfile.mkstemp(prefix="astrbot_apod_", suffix=suffix)
                     downloaded = 0
                     with os.fdopen(fd, "wb") as video_file:
@@ -403,22 +513,26 @@ class APOD(Star):
                             downloaded += len(chunk)
                             if downloaded > max_bytes:
                                 raise ValueError(
-                                    f"视频超过下载上限 {self.video_max_download_mb} MB"
+                                    f"媒体超过下载上限 {max_mb} MB"
                                 )
                             video_file.write(chunk)
             if downloaded == 0:
-                raise ValueError("视频响应为空")
-            logger.info(f"APOD 视频下载完成 url={_log_url(url)} bytes={downloaded} elapsed={time.monotonic() - started:.2f}s")
+                raise ValueError("媒体响应为空")
+            if media_type == "gif":
+                with open(temp_path, "rb") as downloaded_file:
+                    if downloaded_file.read(6) not in {b"GIF87a", b"GIF89a"}:
+                        raise ValueError("GIF 文件签名无效")
+            logger.info(f"APOD 媒体下载完成 media={media_type} url={_log_url(url)} bytes={downloaded} elapsed={time.monotonic() - started:.2f}s")
             return temp_path
         except asyncio.CancelledError:
             self._remove_temp_file(temp_path)
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as exc:
             logger.error(
-                f"APOD 媒体失败 stage=video_download media=video url={_log_url(url)} "
-                f"elapsed={time.monotonic() - started:.2f}s timeout={self.video_download_timeout}s "
+                f"APOD 媒体失败 stage={stage} media={media_type} url={_log_url(url)} "
+                f"elapsed={time.monotonic() - started:.2f}s timeout={timeout_seconds}s "
                 f"bytes={downloaded} expected_bytes={content_length or 'unknown'} "
-                f"error={type(exc).__name__} detail={_log_error(exc)}；将返回视频链接"
+                f"error={type(exc).__name__} detail={_log_error(exc)}；将返回媒体链接"
             )
             if temp_path:
                 self._remove_temp_file(temp_path)
@@ -433,13 +547,22 @@ class APOD(Star):
         except FileNotFoundError:
             pass
         except OSError as exc:
-            logger.warning(f"清理 APOD 临时视频失败：{exc}")
+            logger.warning(f"清理 APOD 临时媒体失败：{exc}")
 
     async def _build_display_payload(self, apod_data: Dict[str, Any]) -> Dict[str, str]:
         explanation = apod_data.get("explanation")
         title = apod_data.get("title")
         url = apod_data.get("media_url") or apod_data.get("image_url")
         apod_date = apod_data.get("date")
+        media_type = str(apod_data.get("media_type", "image"))
+        external_url = str(apod_data.get("external_media_url") or "")
+        thumbnail_url = str(apod_data.get("thumbnail_url") or "")
+        source = external_url or (str(url or "") if media_type == "video" else "")
+        if source and self.external_media_enabled and (self.image or self.video_download):
+            resolved = await self._resolve_external_media(source)
+            if resolved:
+                thumbnail_url = thumbnail_url or str(apod_data.get("image_url") or "")
+                url, media_type = resolved
 
         explanation_zh, title_zh = None, None
         try:
@@ -480,8 +603,9 @@ class APOD(Star):
 
         return {
             "url": str(url).strip() if url else "",
-            "media_type": str(apod_data.get("media_type", "image")),
-            "thumbnail_url": str(apod_data.get("thumbnail_url") or ""),
+            "media_type": media_type,
+            "external_url": external_url,
+            "thumbnail_url": thumbnail_url,
             "title": (title_zh or title or "").strip(),
             "date": str(apod_date).strip() if apod_date else "",
             "explanation": (explanation_zh or explanation or "").strip(),
@@ -491,7 +615,14 @@ class APOD(Star):
         self, payload: Dict[str, str], video_path: Optional[str] = None
     ) -> List[Any]:
         chain = []
-        if payload.get("media_type", "image") == "video":
+        if payload.get("media_type") == "gif":
+            if self.image and video_path:
+                chain.append(_LoggedImage(file=video_path))
+            else:
+                if self.image and payload.get("thumbnail_url"):
+                    chain.append(_LoggedImage(file=payload["thumbnail_url"]))
+                chain.append(Comp.Plain(f"动图链接：{payload.get('url', '')}\n"))
+        elif payload.get("media_type", "image") == "video":
             if self.image and payload.get("thumbnail_url"):
                 chain.append(_LoggedImage(file=payload["thumbnail_url"]))
             if video_path:
@@ -500,6 +631,8 @@ class APOD(Star):
                 chain.append(Comp.Plain(f"视频链接：{payload['url']}\n"))
         elif self.image and payload.get("url"):
             chain.append(_LoggedImage(file=payload["url"]))
+        if payload.get("media_type", "image") == "image" and payload.get("external_url"):
+            chain.append(Comp.Plain(f"外链媒体：{payload['external_url']}\n"))
         if self.title.get("is_show") and payload.get("title"):
             chain.append(Comp.Plain(f"标题：{payload['title']}\n"))
         if self.date.get("is_show") and payload.get("date"):
@@ -525,6 +658,7 @@ class APOD(Star):
                 return {
                     "url": str(cached_payload.get("url", "")).strip(),
                     "media_type": str(cached_payload.get("media_type", "image")),
+                    "external_url": str(cached_payload.get("external_url") or ""),
                     "thumbnail_url": str(cached_payload.get("thumbnail_url") or ""),
                     "title": str(cached_payload.get("title", "")).strip(),
                     "date": cached_date,
@@ -595,6 +729,8 @@ class APOD(Star):
         video_path = None
         if payload.get("media_type") == "video":
             video_path = await self._download_video(payload.get("url", ""))
+        elif payload.get("media_type") == "gif" and self.image:
+            video_path = await self._download_gif(payload.get("url", ""))
         try:
             chain = self._build_chain_from_payload(payload, video_path)
             if not chain:
@@ -677,6 +813,8 @@ class APOD(Star):
         video_path = None
         if payload.get("media_type") == "video":
             video_path = await self._download_video(payload.get("url", ""))
+        elif payload.get("media_type") == "gif" and self.image:
+            video_path = await self._download_gif(payload.get("url", ""))
         try:
             chain = self._build_chain_from_payload(payload, video_path)
             if not chain:

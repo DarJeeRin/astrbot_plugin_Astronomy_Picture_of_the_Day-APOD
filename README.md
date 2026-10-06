@@ -218,7 +218,7 @@ NASA API 临时错误时的重试次数。
 ### 自动推送缓存
 
 - `apod_push:last_sent_date`：记录最近一次已推送的 APOD 日期
-- `apod_push:last_payload:v3:<date>`：记录某天 APOD 的已组装推送内容
+- `apod_push:last_payload:v4:<date>`：记录某天 APOD 的已组装推送内容
 - 一轮定时推送中只拉取一次 APOD，然后复用同一份内容推送给多个目标会话
 
 ## 翻译说明
@@ -249,6 +249,24 @@ NASA API 临时错误时的重试次数。
 - 如果你不需要中文翻译，可以关闭翻译选项并留空 `provider`
 - 如果你希望聊天体验更自然，建议开启 `is_divided`
 - 如果你更希望一次性返回完整内容，可以关闭 `is_divided`
+
+## 外链 GIF 和视频
+
+当 NASA 将动态内容标记为 `image`、仅返回静态缩略图时，插件会保留说明中的 `featured video` / `featured animation` 外链，解析媒体页面中的原始下载链接、HTML5 视频源或 GIF 图片。优先选择原始下载链接，而非页面预览图。
+
+GIF 会下载原文件，通过 AstrBot 图片组件发送并保留所有动画帧，不转换为 MP4，也不需要 FFmpeg；是否播放动画取决于聊天平台和客户端。GIF 下载受 `image` 开关控制，无需开启 `video.download`。外链视频仍需开启 `video.download`；YouTube 等播放器页面继续返回链接，本功能不执行网页 JavaScript 或登录下载。
+
+```json
+"external_media": {
+  "enabled": true,
+  "download_timeout": 120,
+  "max_download_mb": 100
+}
+```
+
+默认启用外链解析。页面解析和 GIF 下载分别使用上述总超时；GIF 有文件大小与签名检查。解析失败、下载超时或文件超限时记录 `stage=external_resolve` / `stage=gif_download`，并返回缩略图与媒体链接。页面最多读取 2 MB，且只解析一层，不遍历无关链接。下载与发送过程中取消任务会清理临时文件。
+
+升级后会使用新的数据和推送内容缓存键；可重新执行 `/apod` 获取 10 月 6 日的 ESA 动图。已经记录成功的当天自动推送不会因升级被重复发送。`/apod_random` 和自动推送也共用此功能。
 
 ## 视频下载与失败日志
 

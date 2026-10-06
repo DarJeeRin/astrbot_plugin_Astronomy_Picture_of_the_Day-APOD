@@ -127,5 +127,28 @@
                 "default": 120
             }
         }
+    },
+    "external_media": {
+        "description": "外链媒体解析与动图下载",
+        "type": "object",
+        "items": {
+            "enabled": {
+                "description": "解析 APOD 中的外链媒体",
+                "hint": "识别说明里的 featured video/animation 外链，下载原始 GIF 或 HTML5 视频；GIF 直接作为图片发送，不转换为 MP4",
+                "type": "bool",
+                "default": true
+            },
+            "download_timeout": {
+                "description": "外链页面和 GIF 下载超时（秒）",
+                "hint": "分别限制页面解析和 GIF 下载；低带宽可调至 300 或 600 秒，视频文件仍使用 video.download_timeout",
+                "type": "int",
+                "default": 120
+            },
+            "max_download_mb": {
+                "description": "外链 GIF 最大下载大小（MB）",
+                "type": "int",
+                "default": 100
+            }
+        }
     }
 }

@@ -5,6 +5,8 @@ Run from an external working directory to keep framework data out of checkout.
 """
 import asyncio
 import importlib.util
+import base64
+import io
 import json
 import os
 import tempfile
@@ -22,6 +24,8 @@ _RUNTIME = tempfile.TemporaryDirectory(prefix="apod-tests-")
 os.environ["ASTRBOT_ROOT"] = _RUNTIME.name
 
 from aiohttp import ClientSession, web
+from PIL import Image as PILImage
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context
@@ -59,6 +63,17 @@ class NormalizationTests(unittest.TestCase):
     def test_non_http_media_is_rejected(self):
         data = APOD._normalize_apod_data(dict(SAMPLE, hdurl='javascript:bad', basic_html='<img src="data:bad">'))
         self.assertEqual(data['image_url'], '')
+
+    def test_upstream_image_classification_preserves_featured_video_link(self):
+        fixture = json.loads((ROOT / 'tests/fixtures/nasa_external_gif.json').read_text())
+        data = APOD._normalize_apod_data(fixture)
+        self.assertEqual(data['media_type'], 'image')
+        self.assertIn('www.esa.int/ESA_Multimedia/', data['external_media_url'])
+        self.assertTrue(data['image_url'])
+
+    def test_featured_media_precedes_related_gif_links(self):
+        data = dict(SAMPLE, explanation='<a href="https://example.com/related.gif">older example</a><a href="https://www.esa.int/featured">featured <b>video</b></a>')
+        self.assertEqual(APOD._normalize_apod_data(data)['external_media_url'], 'https://www.esa.int/featured')
 
     def test_invalid_payloads(self):
         for data in ([], {}, dict(SAMPLE, date='invalid'), dict(SAMPLE, explanation=None)):
@@ -207,6 +222,65 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.plugin.get_apod())
         self.assertIn('数据格式无效', self.plugin.last_apod_error)
 
+    async def test_external_gif_reply_sends_image_and_cleans_file(self):
+        fixture = json.loads((ROOT / 'tests/fixtures/nasa_external_gif.json').read_text())
+        data = APOD._normalize_apod_data(fixture)
+        event = AstrMessageEvent.__new__(AstrMessageEvent)
+        event.session = 'aiocqhttp:GroupMessage:fixture'
+        seen = []
+        async def send(message):
+            images = [item for item in message.chain if isinstance(item, Image)]
+            self.assertEqual(len(images), 1)
+            seen.append(images[0].file)
+            self.assertTrue(Path(images[0].file).exists())
+            self.assertFalse(any(isinstance(item, module.Comp.Video) for item in message.chain))
+        event.send = AsyncMock(side_effect=send)
+        with tempfile.NamedTemporaryFile(suffix='.gif', delete=False) as file:
+            path = file.name
+        with patch.object(self.plugin, 'get_cache_apod', AsyncMock(return_value=data)), patch.object(self.plugin, '_resolve_external_media', AsyncMock(return_value=('https://example.com/original.gif', 'gif'))), patch.object(self.plugin, '_download_gif', AsyncMock(return_value=path)) as download:
+            self.assertEqual([r async for r in self.plugin.apod(event)], [])
+        self.assertEqual(seen, [path])
+        self.assertFalse(Path(path).exists())
+        download.assert_awaited_once_with('https://example.com/original.gif')
+        self.assertFalse(self.plugin.video_download)  # GIF uses image, not video opt-in.
+
+    async def test_external_disabled_preserves_static_image_and_link(self):
+        fixture = json.loads((ROOT / 'tests/fixtures/nasa_external_gif.json').read_text())
+        data = APOD._normalize_apod_data(fixture)
+        self.plugin.external_media_enabled = False
+        with patch.object(self.plugin, '_resolve_external_media', AsyncMock()) as resolve:
+            payload = await self.plugin._build_display_payload(data)
+        resolve.assert_not_awaited()
+        self.assertEqual(payload['media_type'], 'image')
+        self.assertEqual(payload['url'], fixture['hdurl'])
+        self.assertIn('www.esa.int', payload['external_url'])
+
+    async def test_external_gif_push_retains_fields_and_cleans_file(self):
+        fixture = json.loads((ROOT / 'tests/fixtures/nasa_external_gif.json').read_text())
+        fixture['date'] = datetime.now(ZoneInfo('America/New_York')).date().isoformat()
+        data = APOD._normalize_apod_data(fixture)
+        self.plugin.target_unified_msg_origins = ['aiocqhttp:GroupMessage:fixture']
+        with tempfile.NamedTemporaryFile(suffix='.gif', delete=False) as file:
+            path = file.name
+        with patch.object(self.plugin, 'get_cache_apod', AsyncMock(return_value=data)), patch.object(self.plugin, '_resolve_external_media', AsyncMock(return_value=('https://example.com/original.gif', 'gif'))), patch.object(self.plugin, '_download_gif', AsyncMock(return_value=path)):
+            await self.plugin._run_push_once()
+        message = self.context.send_message.call_args.args[1]
+        self.assertEqual(message.chain[0].file, path)
+        self.assertFalse(Path(path).exists())
+        cached = await self.plugin.get_cache(APOD._build_push_payload_cache_key(data['date']))
+        self.assertEqual(cached['media_type'], 'gif')
+        self.assertEqual(cached['url'], 'https://example.com/original.gif')
+        self.assertTrue(cached['external_url'])
+        self.assertEqual(await self.plugin._get_or_build_push_payload(data, data['date']), cached)
+
+    async def test_external_resolve_failure_keeps_thumbnail_and_link(self):
+        fixture = json.loads((ROOT / 'tests/fixtures/nasa_external_gif.json').read_text())
+        with patch.object(self.plugin, '_resolve_external_media', AsyncMock(return_value=None)):
+            payload = await self.plugin._build_display_payload(APOD._normalize_apod_data(fixture))
+        chain = self.plugin._build_chain_from_payload(payload)
+        self.assertEqual(chain[0].file, fixture['hdurl'])
+        self.assertIn('www.esa.int', chain[1].text)
+
     async def test_random_command_fetches_history_without_overwriting_daily_cache(self):
         daily = await self.plugin.get_cache_apod()
         self.payload = dict(SAMPLE)
@@ -328,7 +402,21 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         self.files = patch.object(module.tempfile, 'mkstemp', tracked)
         self.files.start()
         self.first_chunk = asyncio.Event()
+        output = io.BytesIO()
+        frames = [PILImage.new('RGB', (8, 8), color) for color in ['red', 'blue']]
+        frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=100, loop=0)
+        self.gif_bytes = output.getvalue()
         async def handler(request):
+            if request.path == '/page':
+                return web.Response(text='<img src="preview.gif"><a href="original.gif">Download original</a>', content_type='text/html')
+            if request.path == '/movie-page':
+                return web.Response(text='<video><source src="/download" type="video/mp4"></video>', content_type='text/html')
+            if request.path == '/oversize-page':
+                return web.Response(text='x' * (2 * 1024 * 1024 + 1), content_type='text/html')
+            if request.path == '/original.gif':
+                return web.Response(body=self.gif_bytes, content_type='image/gif')
+            if request.path == '/invalid.gif':
+                return web.Response(body=b'not a gif', content_type='image/gif')
             if request.path == '/html':
                 return web.Response(text='<html>not video</html>', content_type='text/html')
             if request.path == '/large':
@@ -361,6 +449,41 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         for path in self.created:
             self.plugin._remove_temp_file(path)
         await self.plugin.terminate()
+
+    async def test_external_page_prefers_original_gif_link(self):
+        result = await self.plugin._resolve_external_media(self.base + '/page')
+        self.assertEqual(result, (self.base + '/original.gif', 'gif'))
+
+    async def test_html5_source_without_extension(self):
+        result = await self.plugin._resolve_external_media(self.base + '/movie-page')
+        self.assertEqual(result, (self.base + '/download', 'video'))
+
+    async def test_oversize_external_page_is_bounded(self):
+        with patch.object(module.logger, 'error') as log:
+            self.assertIsNone(await self.plugin._resolve_external_media(self.base + '/oversize-page'))
+        self.assertIn('stage=external_resolve', log.call_args.args[0])
+
+    async def test_external_disabled_prevents_even_cached_gif_download(self):
+        self.plugin.external_media_enabled = False
+        with patch.object(module.aiohttp, 'ClientSession') as session:
+            self.assertIsNone(await self.plugin._download_gif(self.base + '/original.gif'))
+        session.assert_not_called()
+
+    async def test_gif_download_and_onebot_serialization_preserve_frames(self):
+        path = await self.plugin._download_gif(self.base + '/original.gif')
+        self.assertIsNotNone(path)
+        self.assertEqual(Path(path).read_bytes(), self.gif_bytes)
+        payload = await AiocqhttpMessageEvent._from_segment_to_dict(module._LoggedImage(file=path))
+        preserved = base64.b64decode(payload['data']['file'].removeprefix('base64://'))
+        self.assertEqual(preserved, self.gif_bytes)
+        with PILImage.open(io.BytesIO(preserved)) as image:
+            self.assertEqual(image.n_frames, 2)
+
+    async def test_invalid_gif_signature_is_rejected_and_cleaned(self):
+        with patch.object(module.logger, 'error') as log:
+            self.assertIsNone(await self.plugin._download_gif(self.base + '/invalid.gif'))
+        self.assertIn('stage=gif_download', log.call_args.args[0])
+        self.assertTrue(all(not Path(p).exists() for p in self.created))
 
     async def test_download_exact_bytes(self):
         path = await self.plugin._download_video(self.base + '/direct.mp4')
