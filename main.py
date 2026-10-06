@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import os
+import random
 import re
 import tempfile
 import time
@@ -94,7 +95,7 @@ class _LoggedImage(Comp.Image):
             raise
 
 
-@register("apod", "Cysheper", "NASA APOD plugin", "0.1.1")
+@register("apod", "Cysheper", "NASA APOD plugin", "0.1.2")
 class APOD(Star):
     APOD_API_URL = "https://science.nasa.gov/wp-json/wp/v2/apod-basic"
     APOD_CACHE_KEY = "apod_cache:v3"
@@ -122,6 +123,7 @@ class APOD(Star):
         self.config = config
         self.context = context
         self.last_apod_error: Optional[str] = None
+        self.last_apod_status: Optional[int] = None
         self.push_task: Optional[asyncio.Task] = None
 
     @staticmethod
@@ -634,7 +636,17 @@ class APOD(Star):
 
     @filter.command("apod")
     async def apod(self, event: AstrMessageEvent):
-        logger.info("正在获取 NASA 每日天文图片...")
+        async for result in self._reply_apod(event):
+            yield result
+
+    @filter.command("apod_random")
+    async def apod_random(self, event: AstrMessageEvent):
+        """Select a historical APOD without changing the daily APOD cache."""
+        async for result in self._reply_apod(event, random_apod=True):
+            yield result
+
+    async def _reply_apod(self, event: AstrMessageEvent, random_apod: bool = False):
+        logger.info("正在获取 NASA 随机 APOD..." if random_apod else "正在获取 NASA 每日天文图片...")
 
         if self._needs_translation() and not self.provider:
             logger.warning(
@@ -645,8 +657,10 @@ class APOD(Star):
             )
             return
 
-        # 如果今天的 APOD 缓存仍然有效，就优先复用缓存数据。
-        apod_data = await self.get_cache_apod()
+        # Random requests bypass the daily data cache and push state.
+        apod_data = (
+            await self.get_random_apod() if random_apod else await self.get_cache_apod()
+        )
         if not apod_data:
             yield event.plain_result(
                 self.last_apod_error or "获取 APOD 数据失败，请稍后重试。"
@@ -755,19 +769,40 @@ class APOD(Star):
 
         return apod_data
 
+    async def get_random_apod(self) -> Optional[dict]:
+        # NASA's public JSON API exposes date routes, not a random JSON route.
+        first_day = datetime(1995, 6, 16).date()
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        for _ in range(3):
+            selected = first_day + timedelta(
+                days=random.randint(0, (today - first_day).days)
+            )
+            logger.info(f"随机 APOD 日期：{selected.isoformat()}")
+            data = await self.get_apod(selected.strftime("%y%m%d"))
+            if data is not None:
+                return data
+            # Some early archive dates are missing; reselect only for HTTP 404.
+            if self.last_apod_status != 404:
+                return None
+        return None
+
     # 对上游临时错误进行重试，但鉴权失败时直接停止。
-    async def get_apod(self) -> Optional[dict]:
+    async def get_apod(self, apod_day: Optional[str] = None) -> Optional[dict]:
         # NASA's migrated public endpoint uses YYMMDD and does not require a key.
-        apod_day = datetime.now(ZoneInfo("America/New_York")).strftime("%y%m%d")
+        if apod_day is None:
+            apod_day = datetime.now(ZoneInfo("America/New_York")).strftime("%y%m%d")
         base_url = f"{self.APOD_API_URL}/{apod_day}"
         retryable_statuses = {502, 503, 504}
         self.last_apod_error = None
+        self.last_apod_status = None
         timeout = aiohttp.ClientTimeout(total=self.timeout)
 
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             for attempt in range(self.retry_count + 1):
+                self.last_apod_status = None
                 try:
                     async with session.get(base_url) as response:
+                        self.last_apod_status = response.status
                         if response.status >= 400:
                             error_text = await response.text()
                             logger.error(

@@ -207,6 +207,63 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.plugin.get_apod())
         self.assertIn('数据格式无效', self.plugin.last_apod_error)
 
+    async def test_random_command_fetches_history_without_overwriting_daily_cache(self):
+        daily = await self.plugin.get_cache_apod()
+        self.payload = dict(SAMPLE)
+        offset = (datetime.strptime(SAMPLE['date'], '%Y-%m-%d').date() - datetime(1995, 6, 16).date()).days
+        event = AstrMessageEvent.__new__(AstrMessageEvent)
+        event.session = 'aiocqhttp:GroupMessage:fixture'
+        event.send = AsyncMock()
+        with patch.object(module.random, 'randint', return_value=offset):
+            self.assertEqual([r async for r in self.plugin.apod_random(event)], [])
+        self.assertEqual(self.calls[-1], '/141001')
+        self.assertEqual(await self.plugin.get_cache(APOD.APOD_CACHE_KEY), daily)
+        self.assertIsNone(await self.plugin.get_cache(APOD.PUSH_LAST_SENT_DATE_KEY))
+        chain = event.send.call_args.args[0].chain
+        self.assertEqual(chain[0].file, SAMPLE['hdurl'])
+        self.assertIn(SAMPLE['date'], chain[2].text)
+
+    async def test_random_calls_fetch_each_time_and_use_archive_bounds(self):
+        last = (datetime.now(ZoneInfo('America/New_York')).date() - datetime(1995, 6, 16).date()).days
+        with patch.object(module.random, 'randint', side_effect=[0, last]) as pick:
+            self.assertIsNotNone(await self.plugin.get_random_apod())
+            self.assertIsNotNone(await self.plugin.get_random_apod())
+        self.assertEqual(pick.call_args_list[0].args, (0, last))
+        self.assertEqual(self.calls, ['/950616', '/' + datetime.now(ZoneInfo('America/New_York')).strftime('%y%m%d')])
+
+    async def test_random_missing_dates_reselects_with_limit(self):
+        self.status = 404
+        with patch.object(module.random, 'randint', side_effect=[0, 1, 2]):
+            self.assertIsNone(await self.plugin.get_random_apod())
+        self.assertEqual(self.calls, ['/950616', '/950617', '/950618'])
+        self.assertEqual(self.plugin.last_apod_status, 404)
+
+    async def test_random_access_denial_does_not_reselect(self):
+        self.status = 403
+        self.assertIsNone(await self.plugin.get_random_apod())
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn('访问被拒绝', self.plugin.last_apod_error)
+
+    async def test_random_failure_returns_feedback(self):
+        self.status = 403
+        event = AstrMessageEvent.__new__(AstrMessageEvent)
+        result = [r async for r in self.plugin.apod_random(event)]
+        self.assertIn('访问被拒绝', result[0].chain[0].text)
+
+    async def test_random_video_reuses_download_and_cleanup(self):
+        data = APOD._normalize_apod_data(json.loads((ROOT / 'tests/fixtures/nasa_video.json').read_text()))
+        self.plugin.video_download = True
+        event = AstrMessageEvent.__new__(AstrMessageEvent)
+        event.session = 'aiocqhttp:GroupMessage:fixture'
+        event.send = AsyncMock()
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as file:
+            path = file.name
+        with patch.object(self.plugin, 'get_random_apod', AsyncMock(return_value=data)), patch.object(self.plugin, '_download_video', AsyncMock(return_value=path)) as download:
+            self.assertEqual([r async for r in self.plugin.apod_random(event)], [])
+        download.assert_awaited_once_with(data['media_url'])
+        self.assertTrue(any(isinstance(item, module.Comp.Video) for item in event.send.call_args.args[0].chain))
+        self.assertFalse(Path(path).exists())
+
     async def test_video_without_source_reports_error(self):
         self.payload.update(media_type='video', hdurl='', basic_html='')
         event = AstrMessageEvent.__new__(AstrMessageEvent)
