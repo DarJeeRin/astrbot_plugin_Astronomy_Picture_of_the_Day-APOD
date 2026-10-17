@@ -165,17 +165,15 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         event.session = 'aiocqhttp:GroupMessage:fixture'
         event.send = AsyncMock()
         result = [r async for r in self.plugin.apod(event)]
-        self.assertEqual(result, [])
-        result = [event.send.call_args.args[0]]
-        self.assertEqual(len(result[0].chain), 4)
-        self.assertIsInstance(result[0].chain[0], Image)
-        self.assertEqual(result[0].chain[0].file, SAMPLE['hdurl'])
-        self.assertIsInstance(result[0].chain[1], Plain)
-        self.assertNotIn('<strong>', result[0].chain[-1].text)
-        self.plugin.is_divided = True
-        event.send.reset_mock()
-        self.assertEqual(len([r async for r in self.plugin.apod(event)]), 3)
+        self.assertEqual(len(result), 3)
+        self.assertTrue(all(len(message.chain) == 1 for message in result))
+        self.assertTrue(all(isinstance(message.chain[0], Plain) for message in result))
+        self.assertNotIn('<strong>', result[-1].chain[0].text)
         event.send.assert_awaited_once()
+        media = event.send.call_args.args[0].chain
+        self.assertEqual(len(media), 1)
+        self.assertIsInstance(media[0], Image)
+        self.assertEqual(media[0].file, SAMPLE['hdurl'])
 
     async def test_translation_contract_and_cache(self):
         self.plugin.title['is_translate'] = True
@@ -193,18 +191,66 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
     async def test_push_contract_and_deduplication(self):
         self.plugin.target_unified_msg_origins = ['aiocqhttp:GroupMessage:fixture']
         await self.plugin._run_push_once()
-        self.context.send_message.assert_awaited_once()
-        message = self.context.send_message.call_args.args[1]
+        self.assertEqual(self.context.send_message.await_count, 4)
+        messages = [call.args[1] for call in self.context.send_message.await_args_list]
+        self.assertTrue(all(len(message.chain) == 1 for message in messages))
+        message = messages[0]
         self.assertIsInstance(message, MessageChain)
         self.assertEqual(message.chain[0].file, SAMPLE['hdurl'])
         await self.plugin._run_push_once()
-        self.context.send_message.assert_awaited_once()
+        self.assertEqual(self.context.send_message.await_count, 4)
 
     async def test_unmatched_platform_does_not_mark_sent(self):
         self.plugin.target_unified_msg_origins = ['aiocqhttp:GroupMessage:fixture']
         self.context.send_message.return_value = False
         await self.plugin._run_push_once()
         self.assertIsNone(await self.plugin.get_cache(APOD.PUSH_LAST_SENT_DATE_KEY))
+
+    async def test_video_push_sends_single_segments_to_each_target_before_cleanup(self):
+        self.payload = json.loads((ROOT / 'tests/fixtures/nasa_video.json').read_text())
+        self.payload['date'] = datetime.now(ZoneInfo('America/New_York')).date().isoformat()
+        targets = ['default:GroupMessage:first', 'default:GroupMessage:second']
+        self.plugin.target_unified_msg_origins = targets
+        seen = {target: [] for target in targets}
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as file:
+            path = file.name
+
+        async def send(target, message):
+            # Reproduce OneBot's restriction, including the video + text failure.
+            self.assertEqual(len(message.chain), 1)
+            self.assertTrue(Path(path).exists())
+            item = message.chain[0]
+            if isinstance(item, module.Comp.Video):
+                self.assertEqual(item.path, path)
+            seen[target].append(type(item))
+            return True
+
+        self.context.send_message.side_effect = send
+        with patch.object(self.plugin, '_download_video', AsyncMock(return_value=path)) as download:
+            await self.plugin._run_push_once()
+        expected = [module._LoggedImage, module.Comp.Video, Plain, Plain, Plain]
+        self.assertEqual(seen, {target: expected for target in targets})
+        download.assert_awaited_once()
+        self.assertFalse(Path(path).exists())
+        self.assertEqual(await self.plugin.get_cache(APOD.PUSH_LAST_SENT_DATE_KEY), self.payload['date'])
+
+    async def test_partial_push_failure_does_not_mark_sent(self):
+        self.plugin.target_unified_msg_origins = ['default:GroupMessage:fixture']
+        # A media segment succeeding must not hide a later text failure.
+        self.context.send_message.side_effect = [True, False]
+        await self.plugin._run_push_once()
+        self.assertEqual(self.context.send_message.await_count, 2)
+        self.assertIsNone(await self.plugin.get_cache(APOD.PUSH_LAST_SENT_DATE_KEY))
+
+    async def test_partial_push_failure_continues_with_next_target(self):
+        targets = ['default:GroupMessage:first', 'default:GroupMessage:second']
+        self.plugin.target_unified_msg_origins = targets
+        self.context.send_message.side_effect = [True, OSError('adapter failed'), True, True, True, True]
+        await self.plugin._run_push_once()
+        calls = self.context.send_message.await_args_list
+        self.assertEqual([call.args[0] for call in calls], [targets[0]] * 2 + [targets[1]] * 4)
+        self.assertTrue(all(len(call.args[1].chain) == 1 for call in calls))
+        self.assertEqual(await self.plugin.get_cache(APOD.PUSH_LAST_SENT_DATE_KEY), self.payload['date'])
 
     async def test_503_retries_and_403_does_not(self):
         self.status = 503
@@ -238,7 +284,7 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.NamedTemporaryFile(suffix='.gif', delete=False) as file:
             path = file.name
         with patch.object(self.plugin, 'get_cache_apod', AsyncMock(return_value=data)), patch.object(self.plugin, '_resolve_external_media', AsyncMock(return_value=('https://example.com/original.gif', 'gif'))), patch.object(self.plugin, '_download_gif', AsyncMock(return_value=path)) as download:
-            self.assertEqual([r async for r in self.plugin.apod(event)], [])
+            self.assertEqual(len([r async for r in self.plugin.apod(event)]), 3)
         self.assertEqual(seen, [path])
         self.assertFalse(Path(path).exists())
         download.assert_awaited_once_with('https://example.com/original.gif')
@@ -264,7 +310,10 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
             path = file.name
         with patch.object(self.plugin, 'get_cache_apod', AsyncMock(return_value=data)), patch.object(self.plugin, '_resolve_external_media', AsyncMock(return_value=('https://example.com/original.gif', 'gif'))), patch.object(self.plugin, '_download_gif', AsyncMock(return_value=path)):
             await self.plugin._run_push_once()
-        message = self.context.send_message.call_args.args[1]
+        messages = [call.args[1] for call in self.context.send_message.await_args_list]
+        self.assertEqual(len(messages), 4)
+        self.assertTrue(all(len(message.chain) == 1 for message in messages))
+        message = messages[0]
         self.assertEqual(message.chain[0].file, path)
         self.assertFalse(Path(path).exists())
         cached = await self.plugin.get_cache(APOD._build_push_payload_cache_key(data['date']))
@@ -289,13 +338,16 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         event.session = 'aiocqhttp:GroupMessage:fixture'
         event.send = AsyncMock()
         with patch.object(module.random, 'randint', return_value=offset):
-            self.assertEqual([r async for r in self.plugin.apod_random(event)], [])
+            results = [r async for r in self.plugin.apod_random(event)]
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(len(result.chain) == 1 for result in results))
         self.assertEqual(self.calls[-1], '/141001')
         self.assertEqual(await self.plugin.get_cache(APOD.APOD_CACHE_KEY), daily)
         self.assertIsNone(await self.plugin.get_cache(APOD.PUSH_LAST_SENT_DATE_KEY))
         chain = event.send.call_args.args[0].chain
         self.assertEqual(chain[0].file, SAMPLE['hdurl'])
-        self.assertIn(SAMPLE['date'], chain[2].text)
+        self.assertEqual(len(chain), 1)
+        self.assertIn(SAMPLE['date'], results[1].chain[0].text)
 
     async def test_random_calls_fetch_each_time_and_use_archive_bounds(self):
         last = (datetime.now(ZoneInfo('America/New_York')).date() - datetime(1995, 6, 16).date()).days
@@ -333,9 +385,11 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as file:
             path = file.name
         with patch.object(self.plugin, 'get_random_apod', AsyncMock(return_value=data)), patch.object(self.plugin, '_download_video', AsyncMock(return_value=path)) as download:
-            self.assertEqual([r async for r in self.plugin.apod_random(event)], [])
+            self.assertEqual(len([r async for r in self.plugin.apod_random(event)]), 3)
         download.assert_awaited_once_with(data['media_url'])
-        self.assertTrue(any(isinstance(item, module.Comp.Video) for item in event.send.call_args.args[0].chain))
+        messages = [call.args[0] for call in event.send.await_args_list]
+        self.assertTrue(all(len(message.chain) == 1 for message in messages))
+        self.assertTrue(any(isinstance(message.chain[0], module.Comp.Video) for message in messages))
         self.assertFalse(Path(path).exists())
 
     async def test_video_without_source_reports_error(self):
@@ -373,6 +427,7 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         event.session = 'aiocqhttp:GroupMessage:fixture'
         paths = []
         async def send(message):
+            self.assertEqual(len(message.chain), 1)
             for item in message.chain:
                 if isinstance(item, module.Comp.Video):
                     paths.append(item.path)
@@ -382,7 +437,7 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
             file.write(b'fixture')
             path = file.name
         with patch.object(self.plugin, '_download_video', AsyncMock(return_value=path)) as download:
-            self.assertEqual([r async for r in self.plugin.apod(event)], [])
+            self.assertEqual(len([r async for r in self.plugin.apod(event)]), 3)
         self.assertEqual(paths, [path])
         self.assertFalse(Path(path).exists())
         self.assertTrue(download.call_args.args[0].endswith('.mp4'))
@@ -402,6 +457,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         self.files = patch.object(module.tempfile, 'mkstemp', tracked)
         self.files.start()
         self.first_chunk = asyncio.Event()
+        self.slow_delay = 0.1
         output = io.BytesIO()
         frames = [PILImage.new('RGB', (8, 8), color) for color in ['red', 'blue']]
         frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=100, loop=0)
@@ -428,7 +484,7 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
                 await response.prepare(request)
                 await response.write(b'x' * 128)
                 self.first_chunk.set()
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(self.slow_delay)
                 try:
                     await response.write(b'y')
                 except ConnectionResetError:
@@ -491,14 +547,16 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(Path(path).read_bytes(), b'exact-video-download-bytes')
 
     async def test_timeout_reports_progress_and_cleans_partial_file(self):
-        self.plugin.video_download_timeout = 0.03
+        # Allow connection setup on Windows before timing out the partial stream.
+        self.slow_delay = 1
+        self.plugin.video_download_timeout = 0.5
         with patch.object(module.logger, 'error') as log:
             self.assertIsNone(await self.plugin._download_video(self.base + '/slow'))
         text = log.call_args.args[0]
         self.assertIn('stage=video_download', text)
         self.assertIn('TimeoutError', text)
         self.assertIn('bytes=128', text)
-        self.assertIn('timeout=0.03s', text)
+        self.assertIn('timeout=0.5s', text)
         self.assertTrue(self.created)
         self.assertTrue(all(not Path(p).exists() for p in self.created))
 

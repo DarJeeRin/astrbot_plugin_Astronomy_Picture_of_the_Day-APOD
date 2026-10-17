@@ -61,11 +61,6 @@
             }
         }
     },
-    "is_divided": {
-        "description": "是否分开发送图片和文本内容",
-        "type": "bool",
-        "default": true
-    },
     "timeout": {
         "description": "请求 APOD 数据的超时时间，单位为秒",
         "type": "int",

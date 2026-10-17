@@ -116,7 +116,7 @@ class _LoggedImage(Comp.Image):
             raise
 
 
-@register("apod", "Cysheper", "NASA APOD plugin", "0.1.3")
+@register("apod", "Cysheper", "NASA APOD plugin", "0.1.4")
 class APOD(Star):
     APOD_API_URL = "https://science.nasa.gov/wp-json/wp/v2/apod-basic"
     APOD_CACHE_KEY = "apod_cache:v4"
@@ -316,7 +316,6 @@ class APOD(Star):
         self.title = self._ensure_dict(self.config.get("title", {}))
         self.provider = self.config.get("provider", "")
         self.date = self._ensure_dict(self.config.get("date", {}))
-        self.is_divided = self.config.get("is_divided", True)
         self.timeout = max(1, int(self.config.get("timeout", 120)))
         self.retry_count = max(0, int(self.config.get("retry_count", 2)))
 
@@ -738,7 +737,11 @@ class APOD(Star):
             for target in targets:
                 async def send(msg, target=target):
                     return await self.context.send_message(target, msg)
-                if await self._send_logged(send, MessageChain(chain), payload, target):
+                # Media must be sent alone; count a target only after every segment succeeds.
+                for item in chain:
+                    if not await self._send_logged(send, MessageChain([item]), payload, target):
+                        break
+                else:
                     success_count += 1
         finally:
             self._remove_temp_file(video_path)
@@ -821,13 +824,12 @@ class APOD(Star):
                 yield event.plain_result("当前配置未启用任何可返回的内容。")
                 return
             target = getattr(event, "unified_msg_origin", "unknown")
-            groups = [[item] for item in chain] if self.is_divided else [chain]
-            for items in groups:
-                if any(isinstance(item, (Comp.Image, Comp.Video)) for item in items):
-                    if not await self._send_logged(event.send, MessageChain(items), payload, target):
+            for item in chain:
+                if isinstance(item, (Comp.Image, Comp.Video)):
+                    if not await self._send_logged(event.send, MessageChain([item]), payload, target):
                         yield event.plain_result("APOD 媒体发送失败，请查看 AstrBot 日志。")
                 else:
-                    yield event.chain_result(items)
+                    yield event.chain_result([item])
         finally:
             self._remove_temp_file(video_path)
 
