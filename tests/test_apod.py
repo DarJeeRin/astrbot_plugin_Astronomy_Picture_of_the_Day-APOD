@@ -75,6 +75,27 @@ class NormalizationTests(unittest.TestCase):
         data = dict(SAMPLE, explanation='<a href="https://example.com/related.gif">older example</a><a href="https://www.esa.int/featured">featured <b>video</b></a>')
         self.assertEqual(APOD._normalize_apod_data(data)['external_media_url'], 'https://www.esa.int/featured')
 
+    def test_unrelated_direct_gif_in_explanation_is_ignored(self):
+        # Today's APOD had a Tenor dog GIF linked as "unaided eye"; that must not
+        # become external_media_url and override the official hdurl image.
+        explanation = (
+            'The Great Nebula can be found with the '
+            '<a href="https://c.tenor.com/JhvJXq30yA4AAAAC/tenor.gif">unaided eye</a> '
+            'near Orion.'
+        )
+        data = APOD._normalize_apod_data(dict(SAMPLE, explanation=explanation))
+        self.assertEqual(data['external_media_url'], '')
+        self.assertEqual(data['image_url'], SAMPLE['hdurl'])
+        self.assertEqual(data['media_type'], 'image')
+
+    def test_direct_media_without_featured_label_is_ignored(self):
+        data = dict(
+            SAMPLE,
+            explanation='See this <a href="https://example.com/clip.mp4">clip</a> and '
+                        '<a href="https://example.com/anim.gif">anim</a>.',
+        )
+        self.assertEqual(APOD._normalize_apod_data(data)['external_media_url'], '')
+
     def test_invalid_payloads(self):
         for data in ([], {}, dict(SAMPLE, date='invalid'), dict(SAMPLE, explanation=None)):
             with self.subTest(data=type(data)):
@@ -165,7 +186,7 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         event.session = 'aiocqhttp:GroupMessage:fixture'
         event.send = AsyncMock()
         result = [r async for r in self.plugin.apod(event)]
-        self.assertEqual(len(result), 3)
+        self.assertEqual(len(result), 1)
         self.assertTrue(all(len(message.chain) == 1 for message in result))
         self.assertTrue(all(isinstance(message.chain[0], Plain) for message in result))
         self.assertNotIn('<strong>', result[-1].chain[0].text)
@@ -191,14 +212,14 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
     async def test_push_contract_and_deduplication(self):
         self.plugin.target_unified_msg_origins = ['aiocqhttp:GroupMessage:fixture']
         await self.plugin._run_push_once()
-        self.assertEqual(self.context.send_message.await_count, 4)
+        self.assertEqual(self.context.send_message.await_count, 2)
         messages = [call.args[1] for call in self.context.send_message.await_args_list]
         self.assertTrue(all(len(message.chain) == 1 for message in messages))
         message = messages[0]
         self.assertIsInstance(message, MessageChain)
         self.assertEqual(message.chain[0].file, SAMPLE['hdurl'])
         await self.plugin._run_push_once()
-        self.assertEqual(self.context.send_message.await_count, 4)
+        self.assertEqual(self.context.send_message.await_count, 2)
 
     async def test_unmatched_platform_does_not_mark_sent(self):
         self.plugin.target_unified_msg_origins = ['aiocqhttp:GroupMessage:fixture']
@@ -228,7 +249,7 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         self.context.send_message.side_effect = send
         with patch.object(self.plugin, '_download_video', AsyncMock(return_value=path)) as download:
             await self.plugin._run_push_once()
-        expected = [module._LoggedImage, module.Comp.Video, Plain, Plain, Plain]
+        expected = [module._LoggedImage, module.Comp.Video, Plain]
         self.assertEqual(seen, {target: expected for target in targets})
         download.assert_awaited_once()
         self.assertFalse(Path(path).exists())
@@ -245,10 +266,10 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
     async def test_partial_push_failure_continues_with_next_target(self):
         targets = ['default:GroupMessage:first', 'default:GroupMessage:second']
         self.plugin.target_unified_msg_origins = targets
-        self.context.send_message.side_effect = [True, OSError('adapter failed'), True, True, True, True]
+        self.context.send_message.side_effect = [True, OSError('adapter failed'), True, True]
         await self.plugin._run_push_once()
         calls = self.context.send_message.await_args_list
-        self.assertEqual([call.args[0] for call in calls], [targets[0]] * 2 + [targets[1]] * 4)
+        self.assertEqual([call.args[0] for call in calls], [targets[0]] * 2 + [targets[1]] * 2)
         self.assertTrue(all(len(call.args[1].chain) == 1 for call in calls))
         self.assertEqual(await self.plugin.get_cache(APOD.PUSH_LAST_SENT_DATE_KEY), self.payload['date'])
 
@@ -284,7 +305,7 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.NamedTemporaryFile(suffix='.gif', delete=False) as file:
             path = file.name
         with patch.object(self.plugin, 'get_cache_apod', AsyncMock(return_value=data)), patch.object(self.plugin, '_resolve_external_media', AsyncMock(return_value=('https://example.com/original.gif', 'gif'))), patch.object(self.plugin, '_download_gif', AsyncMock(return_value=path)) as download:
-            self.assertEqual(len([r async for r in self.plugin.apod(event)]), 3)
+            self.assertEqual(len([r async for r in self.plugin.apod(event)]), 1)
         self.assertEqual(seen, [path])
         self.assertFalse(Path(path).exists())
         download.assert_awaited_once_with('https://example.com/original.gif')
@@ -311,7 +332,7 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.plugin, 'get_cache_apod', AsyncMock(return_value=data)), patch.object(self.plugin, '_resolve_external_media', AsyncMock(return_value=('https://example.com/original.gif', 'gif'))), patch.object(self.plugin, '_download_gif', AsyncMock(return_value=path)):
             await self.plugin._run_push_once()
         messages = [call.args[1] for call in self.context.send_message.await_args_list]
-        self.assertEqual(len(messages), 4)
+        self.assertEqual(len(messages), 2)
         self.assertTrue(all(len(message.chain) == 1 for message in messages))
         message = messages[0]
         self.assertEqual(message.chain[0].file, path)
@@ -339,7 +360,7 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         event.send = AsyncMock()
         with patch.object(module.random, 'randint', return_value=offset):
             results = [r async for r in self.plugin.apod_random(event)]
-        self.assertEqual(len(results), 3)
+        self.assertEqual(len(results), 1)
         self.assertTrue(all(len(result.chain) == 1 for result in results))
         self.assertEqual(self.calls[-1], '/141001')
         self.assertEqual(await self.plugin.get_cache(APOD.APOD_CACHE_KEY), daily)
@@ -347,7 +368,7 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         chain = event.send.call_args.args[0].chain
         self.assertEqual(chain[0].file, SAMPLE['hdurl'])
         self.assertEqual(len(chain), 1)
-        self.assertIn(SAMPLE['date'], results[1].chain[0].text)
+        self.assertIn(SAMPLE['date'], results[0].chain[0].text)
 
     async def test_random_calls_fetch_each_time_and_use_archive_bounds(self):
         last = (datetime.now(ZoneInfo('America/New_York')).date() - datetime(1995, 6, 16).date()).days
@@ -385,7 +406,7 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as file:
             path = file.name
         with patch.object(self.plugin, 'get_random_apod', AsyncMock(return_value=data)), patch.object(self.plugin, '_download_video', AsyncMock(return_value=path)) as download:
-            self.assertEqual(len([r async for r in self.plugin.apod_random(event)]), 3)
+            self.assertEqual(len([r async for r in self.plugin.apod_random(event)]), 1)
         download.assert_awaited_once_with(data['media_url'])
         messages = [call.args[0] for call in event.send.await_args_list]
         self.assertTrue(all(len(message.chain) == 1 for message in messages))
@@ -437,7 +458,7 @@ class FrameworkTests(unittest.IsolatedAsyncioTestCase):
             file.write(b'fixture')
             path = file.name
         with patch.object(self.plugin, '_download_video', AsyncMock(return_value=path)) as download:
-            self.assertEqual(len([r async for r in self.plugin.apod(event)]), 3)
+            self.assertEqual(len([r async for r in self.plugin.apod(event)]), 1)
         self.assertEqual(paths, [path])
         self.assertFalse(Path(path).exists())
         self.assertTrue(download.call_args.args[0].endswith('.mp4'))

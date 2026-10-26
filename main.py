@@ -116,7 +116,7 @@ class _LoggedImage(Comp.Image):
             raise
 
 
-@register("apod", "Cysheper", "NASA APOD plugin", "0.1.4")
+@register("apod", "Cysheper", "NASA APOD plugin", "0.1.6")
 class APOD(Star):
     APOD_API_URL = "https://science.nasa.gov/wp-json/wp/v2/apod-basic"
     APOD_CACHE_KEY = "apod_cache:v4"
@@ -243,10 +243,13 @@ class APOD(Star):
                 r"featured (?:video|animation|movie|gif)", " ".join(item[1].split()), re.I
             )),
         )
+        # Only NASA "featured video/animation/movie/gif" links are external media.
+        # Direct .gif/.mp4 URLs in explanation text are often unrelated (or spam) and
+        # must not override the official APOD image/video.
         for href, label in links:
             label = " ".join(label.split())
             href = urljoin(cls._http_url(data.get("permalink")) or cls.APOD_API_URL, href)
-            if re.fullmatch(r"featured (?:video|animation|movie|gif)", label, re.I) or cls._direct_media_type(href):
+            if re.fullmatch(r"featured (?:video|animation|movie|gif)", label, re.I):
                 candidate = cls._http_url(href)
                 if candidate:
                     normalized["external_media_url"] = candidate
@@ -613,31 +616,38 @@ class APOD(Star):
     def _build_chain_from_payload(
         self, payload: Dict[str, str], video_path: Optional[str] = None
     ) -> List[Any]:
+        # Media items stay separate (OneBot: one image/video per message).
+        # All text fields are merged into one Plain so group chat gets at most
+        # media once + text once (video with thumbnail may still send two media).
         chain = []
+        text_parts: List[str] = []
         if payload.get("media_type") == "gif":
             if self.image and video_path:
                 chain.append(_LoggedImage(file=video_path))
             else:
                 if self.image and payload.get("thumbnail_url"):
                     chain.append(_LoggedImage(file=payload["thumbnail_url"]))
-                chain.append(Comp.Plain(f"动图链接：{payload.get('url', '')}\n"))
+                if payload.get("url"):
+                    text_parts.append(f"动图链接：{payload.get('url', '')}")
         elif payload.get("media_type", "image") == "video":
             if self.image and payload.get("thumbnail_url"):
                 chain.append(_LoggedImage(file=payload["thumbnail_url"]))
             if video_path:
                 chain.append(Comp.Video.fromFileSystem(path=video_path))
             elif payload.get("url"):
-                chain.append(Comp.Plain(f"视频链接：{payload['url']}\n"))
+                text_parts.append(f"视频链接：{payload['url']}")
         elif self.image and payload.get("url"):
             chain.append(_LoggedImage(file=payload["url"]))
         if payload.get("media_type", "image") == "image" and payload.get("external_url"):
-            chain.append(Comp.Plain(f"外链媒体：{payload['external_url']}\n"))
+            text_parts.append(f"外链媒体：{payload['external_url']}")
         if self.title.get("is_show") and payload.get("title"):
-            chain.append(Comp.Plain(f"标题：{payload['title']}\n"))
+            text_parts.append(f"标题：{payload['title']}")
         if self.date.get("is_show") and payload.get("date"):
-            chain.append(Comp.Plain(f"日期：{payload['date']}\n"))
+            text_parts.append(f"日期：{payload['date']}")
         if self.explanation.get("is_show") and payload.get("explanation"):
-            chain.append(Comp.Plain(payload["explanation"]))
+            text_parts.append(payload["explanation"])
+        if text_parts:
+            chain.append(Comp.Plain("\n".join(text_parts)))
         return chain
 
     def _get_round_targets(self) -> List[str]:
@@ -737,7 +747,7 @@ class APOD(Star):
             for target in targets:
                 async def send(msg, target=target):
                     return await self.context.send_message(target, msg)
-                # Media must be sent alone; count a target only after every segment succeeds.
+                # OneBot: one media item per message; text is already a single Plain.
                 for item in chain:
                     if not await self._send_logged(send, MessageChain([item]), payload, target):
                         break
