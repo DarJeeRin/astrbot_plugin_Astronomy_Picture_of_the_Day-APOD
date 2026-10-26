@@ -116,12 +116,12 @@ class _LoggedImage(Comp.Image):
             raise
 
 
-@register("apod", "Cysheper", "NASA APOD plugin", "0.1.6")
+@register("apod", "Cysheper", "NASA APOD plugin", "0.1.7")
 class APOD(Star):
     APOD_API_URL = "https://science.nasa.gov/wp-json/wp/v2/apod-basic"
-    APOD_CACHE_KEY = "apod_cache:v4"
+    APOD_CACHE_KEY = "apod_cache:v5"
     PUSH_LAST_SENT_DATE_KEY = "apod_push:last_sent_date"
-    PUSH_PAYLOAD_KEY_PREFIX = "apod_push:last_payload:v4:"
+    PUSH_PAYLOAD_KEY_PREFIX = "apod_push:last_payload:v5:"
 
     DIRECT_VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm"}
     EXTERNAL_VIDEO_PAGE_HOSTS = {

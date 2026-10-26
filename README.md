@@ -211,7 +211,7 @@ NASA API 临时错误时的重试次数。
 ### 自动推送缓存
 
 - `apod_push:last_sent_date`：记录最近一次已推送的 APOD 日期
-- `apod_push:last_payload:v4:<date>`：记录某天 APOD 的已组装推送内容
+- `apod_push:last_payload:v5:<date>`：记录某天 APOD 的已组装推送内容
 - 一轮定时推送中只拉取一次 APOD，然后复用同一份内容推送给多个目标会话
 
 ## 翻译说明
